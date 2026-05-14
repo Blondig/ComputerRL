@@ -431,6 +431,8 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         max_trajectory_length=args.max_trajectory_length,
         client_password=args.client_password,
         gen_func=call_llm,
+        omni_data_dir=args.omni_data_dir,
+        omni_llm_model=args.omni_llm_model,
     )
 
     for domain in tqdm(test_all_meta, desc="Domain"):

@@ -74,6 +74,9 @@ class AutoGLMAgent:
         client_password="password",
         gen_func=None,
         tool_in_sys_msg: bool = True,
+        omni_data_dir="./omni_step_memory", 
+        omni_llm_model="qwen/qwen3.5-122b-a10b",
+        omni_top_k: int = 5,
     ):
         self.action_space = action_space
         self.observation_type = observation_type
@@ -90,6 +93,11 @@ class AutoGLMAgent:
         self.client_password = client_password
         self.gen_func = gen_func
         self.tool_in_sys_msg = tool_in_sys_msg
+
+        self._omni_data_dir = omni_data_dir
+        self._omni_llm_model = omni_llm_model
+        self._omni_top_k = omni_top_k
+        self._init_omni()
 
         self.tool_list = {
             "libreoffice_calc": "CalcTools",
@@ -209,9 +217,35 @@ class AutoGLMAgent:
 
         return actions
 
-    def format_history(self, max_turns=30):
+    def format_history(self, current_exe_result="", max_turns=30):
         history = []
-        for ix in range(self.turn_number):
+        # for ix in range(self.turn_number):
+        #     if ix == 0:
+        #         env_input = "**Environment State (Omitted)**"
+        #     else:
+        #         env_input = (
+        #             f"**Environment State (Omitted)**\nPrevious Action Result: {self.contents[ix - 1]['exe_result']}"
+        #         )
+
+        #     env_input = env_input[:2000] + "..." if len(env_input) > 2000 else env_input
+        #     response = (
+        #         self.contents[ix]["response"][:1500] + "..."
+        #         if len(self.contents[ix]["response"]) > 1500
+        #         else self.contents[ix]["response"]
+        #     )
+        #     history.append({"role": "user", "content": [{"type": "text", "text": env_input}]})
+        #     history.append({"role": "assistant", "content": [{"type": "text", "text": response}]})
+
+        # revise for the omni memory implenmentation
+
+        if self._omni is not None:
+            query_a = self.contents[-1]["instruction"] if self.contents else ""
+            query_b = current_exe_result
+            indices = self._omni_retrieve(query_a, query_b)
+        else:
+            indices = range(self.turn_number)  # fallback to sliding window if omni is not available
+    
+        for ix in indices:  
             if ix == 0:
                 env_input = "**Environment State (Omitted)**"
             else:
@@ -229,9 +263,30 @@ class AutoGLMAgent:
             history.append({"role": "assistant", "content": [{"type": "text", "text": response}]})
 
         return history[-max_turns * 2:]
+    
+    def _omni_retrieve(self, query_a, query_b):
+        indices = []
+        for query in filter(None, [query_a, query_b]):
+            try:
+                result = self._omni.query(query, top_k=self._omni_top_k, auto_expand=False)
+            except Exception as e:
+                logger.warning(f"Omni query failed: {e}")
+                continue
+            for item in (result.items if hasattr(result, "items") else []):
+                for tag in (item.get("tags") or []):
+                    if isinstance(tag, str) and tag.startswith("step:"):
+                        try:
+                            indices.append(int(tag.split(":")[1]))
+                            break
+                        except (ValueError, IndexError):
+                            pass
+        if not indices:
+            return list(range(self.turn_number))[-self._omni_top_k:]
+        return sorted(set(i for i in indices if 0 <= i < self.turn_number))
 
     def predict(self, instruction: str, obs: Dict) -> List:
-        history = self.format_history()
+        # history = self.format_history()
+        history = self.format_history(obs.get("exe_result", ""))
         messages = self.prepare(instruction, obs, history)
 
         assert self.gen_func is not None, "gen_func is not set"
@@ -259,6 +314,14 @@ class AutoGLMAgent:
                 **obs,
             }
         )
+
+        if self._omni is not None:
+            text = f"Context: {obs.get('exe_result', '')[:200]}\nAction: {response[:800]}"
+            try:
+                self._omni.add_text(text, tags=[f"step:{self.contents[-1]['index']}"], force=True)
+            except Exception as e:
+                logger.warning(f"Omni add_text failed: {e}")
+
         return response, actions
 
     def reset(self, _logger=None):
@@ -266,3 +329,16 @@ class AutoGLMAgent:
         logger = _logger if _logger is not None else logging.getLogger("desktopenv.aguvis_agent")
 
         self.contents = []
+        self._init_omni()
+
+    def _init_omni(self):
+        if not self._omni_data_dir:
+            self._omni = None
+            return
+        from omni_memory import OmniMemoryOrchestrator, OmniMemoryConfig
+        config = OmniMemoryConfig()
+        config.embedding.model_name = "all-MiniLM-L6-v2"
+        config.embedding.embedding_dim = 384
+        config.llm.summary_model = self._omni_llm_model
+        config.llm.query_model = self._omni_llm_model
+        self._omni = OmniMemoryOrchestrator(config=config, data_dir=self._omni_data_dir)
