@@ -4,6 +4,7 @@ Utils and basic architecture credit to https://github.com/web-arena-x/webarena/b
 
 import argparse
 import datetime
+from html import parser
 import json
 import logging
 import os
@@ -113,6 +114,10 @@ def config() -> argparse.Namespace:
 
     # logging related
     parser.add_argument("--result_dir", type=str, default="./results")
+
+    parser.add_argument("--omni_data_dir", type=str, default=None)
+    parser.add_argument("--omni_llm_model", type=str, default="autoglm-os")
+    
     args = parser.parse_args()
 
     return args
