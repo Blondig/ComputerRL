@@ -322,7 +322,8 @@ class AutoGLMAgent:
         if self._omni is not None:
             text = f"Context: {obs.get('exe_result', '')[:200]}\nAction: {response[:800]}"
             try:
-                self._omni.add_text(text, tags=[f"step:{self.contents[-1]['index']}"], force=True)
+                result = self._omni.add_text(text, tags=[f"step:{self.contents[-1]['index']}"], force=True)
+                logger.info(f"Omni store step={self.contents[-1]['index']} success={result.success} error={getattr(result, 'error', None)}")
             except Exception as e:
                 logger.warning(f"Omni add_text failed: {e}")
 
