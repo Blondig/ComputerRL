@@ -74,8 +74,8 @@ class AutoGLMAgent:
         client_password="password",
         gen_func=None,
         tool_in_sys_msg: bool = True,
-        omni_data_dir="./omni_step_memory", 
-        omni_llm_model="qwen/qwen3.5-122b-a10b",
+        omni_data_dir=None, 
+        omni_llm_model="autoglm-os",
         omni_top_k: int = 5,
     ):
         self.action_space = action_space
@@ -273,6 +273,7 @@ class AutoGLMAgent:
                 logger.warning(f"Omni query failed: {e}")
                 continue
             for item in (result.items if hasattr(result, "items") else []):
+                logger.info(f"Omni item score={item.get('score', 0):.3f} tags={item.get('tags')}")
                 for tag in (item.get("tags") or []):
                     if isinstance(tag, str) and tag.startswith("step:"):
                         try:
@@ -281,8 +282,11 @@ class AutoGLMAgent:
                         except (ValueError, IndexError):
                             pass
         if not indices:
+            logger.info(f"Omni retrieve empty, fallback to sliding window (turn={self.turn_number})")
             return list(range(self.turn_number))[-self._omni_top_k:]
-        return sorted(set(i for i in indices if 0 <= i < self.turn_number))
+        result_indices = sorted(set(i for i in indices if 0 <= i < self.turn_number))
+        logger.info(f"Omni retrieved indices={result_indices} from {self.turn_number} turns")
+        return result_indices
 
     def predict(self, instruction: str, obs: Dict) -> List:
         # history = self.format_history()
