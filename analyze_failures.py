@@ -1,20 +1,25 @@
 """
-Analyze failed OSWorld tasks using a local vllm model.
+Analyze failed OSWorld/ComputerRL tasks using a local vllm model.
 
 Usage:
     python analyze_failures.py \
         --results_dir results/b1_chrome_qwen/pyautogui/screenshot/qwen/qwen3.5-122b-a10b \
+        --eval_dir ../OSWorld/evaluation_examples \
         --domain chrome \
-        --model Qwen/Qwen3.5-72B-Instruct \
+        --model Qwen/Qwen3-8B-Instruct \
         --base_url http://localhost:8000/v1 \
         --output failure_analysis.json
+
+    # test with 5 tasks first
+    python analyze_failures.py ... --limit 5
 """
 
 import argparse
 import json
-import os
 import sys
+from collections import Counter
 from pathlib import Path
+
 from openai import OpenAI
 
 ANALYSIS_PROMPT = """\
@@ -28,9 +33,9 @@ You are analyzing a failed desktop automation task.
 
 ## Your Job
 Identify WHY the task failed. Be concise and specific. Output JSON with these fields:
-- "failure_type": one of ["stuck_in_loop", "wrong_target", "missing_step", "api_misuse", "task_impossible", "timeout", "other"]
+- "failure_type": one of ["stuck_in_loop", "wrong_target", "missing_step", "api_misuse", "task_impossible", "no_result", "other"]
 - "root_cause": 1-2 sentences describing what went wrong
-- "key_mistake": the specific step or pattern that caused failure (e.g. "repeatedly clicked same coordinates without checking result")
+- "key_mistake": the specific step or pattern that caused failure
 - "fix_hint": 1 sentence on what should have been done differently
 
 Return only valid JSON, no markdown wrapper."""
@@ -68,7 +73,11 @@ def format_trajectory(traj_path: Path, max_steps: int = 30) -> str:
             action = action[:300] + "..."
         done = step.get("done", False)
         info = step.get("info", {})
-        lines.append(f"Step {n}: {action}" + (" [DONE]" if done else "") + (f" info={info}" if info else ""))
+        lines.append(
+            f"Step {n}: {action}"
+            + (" [DONE]" if done else "")
+            + (f" info={info}" if info else "")
+        )
 
     if len(steps) > max_steps:
         lines.append(f"... ({len(steps) - max_steps} more steps truncated)")
@@ -91,13 +100,24 @@ def analyze_one(client: OpenAI, model: str, instruction: str, trajectory: str) -
         return {"raw_response": raw, "parse_error": True}
 
 
-def collect_failed_tasks(results_dir: Path, domain_filter: str | None) -> list[dict]:
-    failed = []
-    # structure: results_dir / domain / example_id / result.txt
-    for result_file in sorted(results_dir.rglob("result.txt")):
-        try:
-            score = float(result_file.read_text().strip())
-        except (ValueError, IOError):
+def get_task_status(example_dir: Path) -> tuple[str, float | None]:
+    """Returns (status, score). status: 'success' | 'failed' | 'no_result'."""
+    result_file = example_dir / "result.txt"
+    if not result_file.exists():
+        return "no_result", None
+    try:
+        score = float(result_file.read_text().strip())
+        return ("success" if score > 0 else "failed"), score
+    except (ValueError, IOError):
+        return "no_result", None
+
+
+def collect_tasks(results_dir: Path, domain_filter: str | None) -> dict:
+    """Scan all example dirs. Returns success/failed lists and no_result count."""
+    buckets: dict = {"success": [], "failed": [], "no_result": 0}
+
+    for domain_dir in sorted(results_dir.iterdir()):
+        if not domain_dir.is_dir():
             continue
         domain = domain_dir.name
         if domain_filter and domain != domain_filter:
@@ -106,36 +126,36 @@ def collect_failed_tasks(results_dir: Path, domain_filter: str | None) -> list[d
         for example_dir in sorted(domain_dir.iterdir()):
             if not example_dir.is_dir():
                 continue
+
+            status, score = get_task_status(example_dir)
+            if status == "no_result":
+                buckets["no_result"] += 1
+                continue
+
             traj_path = example_dir / "traj.jsonl"
             if not traj_path.exists():
                 continue
 
-            status, score = get_task_status(example_dir)
             buckets[status].append({
                 "domain": domain,
                 "example_id": example_dir.name,
                 "example_dir": example_dir,
                 "traj_path": traj_path,
                 "score": score,
-                "status": status,
             })
 
     return buckets
 
 
-def aggregate_summary(results: list[dict], skipped_success: int, skipped_no_traj: int) -> dict:
-    from collections import Counter
+def aggregate_summary(results: list[dict], skipped_success: int) -> dict:
     failure_types = Counter(
         r["analysis"].get("failure_type", "unknown")
         for r in results
         if "analysis" in r and not r["analysis"].get("parse_error")
     )
-    status_counts = Counter(r["status"] for r in results)
     return {
         "analyzed": len(results),
         "skipped_success": skipped_success,
-        "skipped_no_traj": skipped_no_traj,
-        "status_counts": dict(status_counts),
         "failure_type_counts": dict(failure_types.most_common()),
         "most_common_failure": failure_types.most_common(1)[0][0] if failure_types else "unknown",
     }
@@ -143,14 +163,14 @@ def aggregate_summary(results: list[dict], skipped_success: int, skipped_no_traj
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results_dir", required=True, help="Path to model results dir (contains domain subdirs)")
-    parser.add_argument("--eval_dir", default="evaluation_examples", help="Path to evaluation_examples dir")
-    parser.add_argument("--domain", default=None, help="Filter to specific domain (e.g. chrome)")
-    parser.add_argument("--model", default="qwen3.5-122b-a10b", help="Model name served by vllm")
-    parser.add_argument("--base_url", default="http://localhost:8000/v1", help="vllm OpenAI-compatible endpoint")
-    parser.add_argument("--output", default="failure_analysis.json", help="Output JSON file")
-    parser.add_argument("--max_steps", type=int, default=30, help="Max trajectory steps to send to LLM")
-    parser.add_argument("--limit", type=int, default=None, help="Process at most N failed tasks (for testing)")
+    parser.add_argument("--results_dir", required=True)
+    parser.add_argument("--eval_dir", default="evaluation_examples")
+    parser.add_argument("--domain", default=None)
+    parser.add_argument("--model", default="qwen3.5-122b-a10b")
+    parser.add_argument("--base_url", default="http://localhost:8000/v1")
+    parser.add_argument("--output", default="failure_analysis.json")
+    parser.add_argument("--max_steps", type=int, default=30)
+    parser.add_argument("--limit", type=int, default=None, help="Process at most N tasks (for testing)")
     args = parser.parse_args()
 
     results_dir = Path(args.results_dir)
@@ -165,18 +185,16 @@ def main():
     buckets = collect_tasks(results_dir, args.domain)
     print(f"success={len(buckets['success'])}  failed={len(buckets['failed'])}  no_result={len(buckets['no_result'])}")
 
-    to_analyze = buckets["failed"] + buckets["no_result"]
+    to_analyze = buckets["failed"]
     if args.limit:
         to_analyze = to_analyze[: args.limit]
-
-    print(f"Analyzing {len(to_analyze)} tasks (failed + no_result)")
+    print(f"Analyzing {len(to_analyze)} failed tasks")
 
     all_results = []
     for i, task in enumerate(to_analyze):
         domain = task["domain"]
         example_id = task["example_id"]
-        status = task["status"]
-        print(f"[{i+1}/{len(to_analyze)}] [{status}] {domain}/{example_id} ... ", end="", flush=True)
+        print(f"[{i+1}/{len(to_analyze)}] {domain}/{example_id} ... ", end="", flush=True)
 
         instruction = load_instruction(eval_dir, domain, example_id)
         trajectory = format_trajectory(task["traj_path"], max_steps=args.max_steps)
@@ -191,29 +209,18 @@ def main():
         all_results.append({
             "domain": domain,
             "example_id": example_id,
-            "status": status,
             "instruction": instruction,
             "analysis": analysis,
         })
 
-    summary = aggregate_summary(
-        all_results,
-        skipped_success=len(buckets["success"]),
-        skipped_no_traj=0,
-    )
-    output = {
-        "summary": summary,
-        "tasks": all_results,
-    }
-
+    summary = aggregate_summary(all_results, skipped_success=len(buckets["success"]))
     with open(args.output, "w") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+        json.dump({"summary": summary, "tasks": all_results}, f, indent=2, ensure_ascii=False)
 
     print(f"\n=== Summary ===")
-    print(f"Analyzed: {summary['analyzed']}  (success skipped: {summary['skipped_success']})")
-    print(f"By status: {summary['status_counts']}")
+    print(f"success={len(buckets['success'])}  failed={len(all_results)}  no_result={buckets['no_result']}")
     print(f"Failure types: {summary['failure_type_counts']}")
-    print(f"Output saved to: {args.output}")
+    print(f"Output: {args.output}")
 
 
 if __name__ == "__main__":
