@@ -183,7 +183,7 @@ def main():
     client = OpenAI(base_url=args.base_url, api_key="EMPTY")
 
     buckets = collect_tasks(results_dir, args.domain)
-    print(f"success={len(buckets['success'])}  failed={len(buckets['failed'])}  no_result={len(buckets['no_result'])}")
+    print(f"success={len(buckets['success'])}  failed={len(buckets['failed'])}  no_result={buckets['no_result']}")
 
     to_analyze = buckets["failed"]
     if args.limit:
