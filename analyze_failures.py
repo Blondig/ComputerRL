@@ -99,38 +99,43 @@ def collect_failed_tasks(results_dir: Path, domain_filter: str | None) -> list[d
             score = float(result_file.read_text().strip())
         except (ValueError, IOError):
             continue
-        if score > 0:
-            continue
-
-        example_dir = result_file.parent
-        example_id = example_dir.name
-        domain = example_dir.parent.name
-
+        domain = domain_dir.name
         if domain_filter and domain != domain_filter:
             continue
 
-        traj_path = example_dir / "traj.jsonl"
-        if not traj_path.exists():
-            continue
+        for example_dir in sorted(domain_dir.iterdir()):
+            if not example_dir.is_dir():
+                continue
+            traj_path = example_dir / "traj.jsonl"
+            if not traj_path.exists():
+                continue
 
-        failed.append({
-            "domain": domain,
-            "example_id": example_id,
-            "example_dir": example_dir,
-            "traj_path": traj_path,
-        })
-    return failed
+            status, score = get_task_status(example_dir)
+            buckets[status].append({
+                "domain": domain,
+                "example_id": example_dir.name,
+                "example_dir": example_dir,
+                "traj_path": traj_path,
+                "score": score,
+                "status": status,
+            })
+
+    return buckets
 
 
-def aggregate_summary(results: list[dict]) -> dict:
+def aggregate_summary(results: list[dict], skipped_success: int, skipped_no_traj: int) -> dict:
     from collections import Counter
     failure_types = Counter(
         r["analysis"].get("failure_type", "unknown")
         for r in results
         if "analysis" in r and not r["analysis"].get("parse_error")
     )
+    status_counts = Counter(r["status"] for r in results)
     return {
-        "total_failed": len(results),
+        "analyzed": len(results),
+        "skipped_success": skipped_success,
+        "skipped_no_traj": skipped_no_traj,
+        "status_counts": dict(status_counts),
         "failure_type_counts": dict(failure_types.most_common()),
         "most_common_failure": failure_types.most_common(1)[0][0] if failure_types else "unknown",
     }
@@ -157,17 +162,21 @@ def main():
 
     client = OpenAI(base_url=args.base_url, api_key="EMPTY")
 
-    failed_tasks = collect_failed_tasks(results_dir, args.domain)
-    if args.limit:
-        failed_tasks = failed_tasks[: args.limit]
+    buckets = collect_tasks(results_dir, args.domain)
+    print(f"success={len(buckets['success'])}  failed={len(buckets['failed'])}  no_result={len(buckets['no_result'])}")
 
-    print(f"Found {len(failed_tasks)} failed tasks to analyze")
+    to_analyze = buckets["failed"] + buckets["no_result"]
+    if args.limit:
+        to_analyze = to_analyze[: args.limit]
+
+    print(f"Analyzing {len(to_analyze)} tasks (failed + no_result)")
 
     all_results = []
-    for i, task in enumerate(failed_tasks):
+    for i, task in enumerate(to_analyze):
         domain = task["domain"]
         example_id = task["example_id"]
-        print(f"[{i+1}/{len(failed_tasks)}] {domain}/{example_id} ... ", end="", flush=True)
+        status = task["status"]
+        print(f"[{i+1}/{len(to_analyze)}] [{status}] {domain}/{example_id} ... ", end="", flush=True)
 
         instruction = load_instruction(eval_dir, domain, example_id)
         trajectory = format_trajectory(task["traj_path"], max_steps=args.max_steps)
@@ -182,11 +191,16 @@ def main():
         all_results.append({
             "domain": domain,
             "example_id": example_id,
+            "status": status,
             "instruction": instruction,
             "analysis": analysis,
         })
 
-    summary = aggregate_summary(all_results)
+    summary = aggregate_summary(
+        all_results,
+        skipped_success=len(buckets["success"]),
+        skipped_no_traj=0,
+    )
     output = {
         "summary": summary,
         "tasks": all_results,
@@ -196,7 +210,8 @@ def main():
         json.dump(output, f, indent=2, ensure_ascii=False)
 
     print(f"\n=== Summary ===")
-    print(f"Total failed: {summary['total_failed']}")
+    print(f"Analyzed: {summary['analyzed']}  (success skipped: {summary['skipped_success']})")
+    print(f"By status: {summary['status_counts']}")
     print(f"Failure types: {summary['failure_type_counts']}")
     print(f"Output saved to: {args.output}")
 
