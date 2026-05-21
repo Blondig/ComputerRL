@@ -23,22 +23,23 @@ from pathlib import Path
 from openai import OpenAI
 
 ANALYSIS_PROMPT = """\
-You are analyzing a failed desktop automation task.
+You are a post-mortem analyst. A desktop automation agent has already finished running and FAILED. \
+Do NOT continue the task. Do NOT suggest next actions. Your ONLY job is to explain why it failed.
 
-## Task Instruction
+## Task Instruction (what the agent was supposed to do)
 {instruction}
 
-## Trajectory (all steps)
+## What the agent actually did (completed trajectory, task is over)
 {trajectory}
 
-## Your Job
-Identify WHY the task failed. Be concise and specific. Output JSON with these fields:
-- "failure_type": one of ["stuck_in_loop", "wrong_target", "missing_step", "api_misuse", "task_impossible", "no_result", "other"]
-- "root_cause": 1-2 sentences describing what went wrong
-- "key_mistake": the specific step or pattern that caused failure
-- "fix_hint": 1 sentence on what should have been done differently
-
-Return only valid JSON, no markdown wrapper."""
+## Output format
+Respond with a single JSON object and nothing else:
+{{
+  "failure_type": "<one of: stuck_in_loop | wrong_target | missing_step | api_misuse | task_impossible | other>",
+  "root_cause": "<1-2 sentences: what went wrong>",
+  "key_mistake": "<the specific step or repeated pattern that caused failure>",
+  "fix_hint": "<1 sentence: what the agent should have done differently>"
+}}"""
 
 
 def load_instruction(eval_dir: Path, domain: str, example_id: str) -> str:
@@ -92,6 +93,7 @@ def analyze_one(client: OpenAI, model: str, instruction: str, trajectory: str) -
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
         max_tokens=512,
+        response_format={"type": "json_object"},
     )
     raw = response.choices[0].message.content.strip()
     try:
