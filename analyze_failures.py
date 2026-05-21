@@ -59,8 +59,11 @@ def format_trajectory(traj_path: Path, max_steps: int = 30) -> str:
     lines = []
     for step in steps[:max_steps]:
         n = step.get("step_num", "?")
-        action = step.get("action", "").replace("\n", " ").strip()
-        # truncate very long actions
+        raw_action = step.get("action", "")
+        if isinstance(raw_action, dict):
+            action = json.dumps(raw_action, ensure_ascii=False)
+        else:
+            action = str(raw_action).replace("\n", " ").strip()
         if len(action) > 300:
             action = action[:300] + "..."
         done = step.get("done", False)
