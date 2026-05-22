@@ -22,6 +22,7 @@ from tqdm import tqdm
 import lib_run_single
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
 from mm_agents.autoglm_v import AutoGLMAgent
+from mm_agents.error_ledger import ErrorLedger
 from typing import Optional, Dict, Any
 from openai import OpenAI
 
@@ -117,6 +118,8 @@ def config() -> argparse.Namespace:
 
     parser.add_argument("--omni_data_dir", type=str, default=None)
     parser.add_argument("--omni_llm_model", type=str, default="autoglm-os")
+    parser.add_argument("--error_ledger", type=str, default=None,
+                        help="Path to error ledger JSON file. If set, enables cross-task error memory.")
     
     args = parser.parse_args()
 
@@ -428,6 +431,10 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         os_type="Ubuntu",
         require_a11y_tree=args.observation_type in ["a11y_tree", "screenshot_a11y_tree", "som"],
     )
+    ledger = ErrorLedger(args.error_ledger) if args.error_ledger else None
+    if ledger:
+        logger.info(f"ErrorLedger enabled: {args.error_ledger} ({len(ledger.entries)} existing entries)")
+
     agent = AutoGLMAgent(
         action_space=args.action_space,
         observation_type=args.observation_type,
@@ -438,6 +445,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         gen_func=call_llm,
         omni_data_dir=args.omni_data_dir,
         omni_llm_model=args.omni_llm_model,
+        error_ledger=ledger,
     )
 
     for domain in tqdm(test_all_meta, desc="Domain"):
@@ -476,6 +484,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
                     args,
                     example_result_dir,
                     scores,
+                    ledger=ledger,
                 )
             except Exception as e:
                 logger.error(f"Exception in {domain}/{example_id}: {e}")

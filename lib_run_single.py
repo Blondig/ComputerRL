@@ -94,7 +94,7 @@ def run_single_example_human(env, example, max_steps, instruction, args, example
     with open(os.path.join(example_result_dir, "result.txt"), "w", encoding="utf-8") as f:
         f.write(f"{result}\n")
 
-def run_single_example_autoglm(agent, env, example, max_steps, instruction, args, example_result_dir, scores):
+def run_single_example_autoglm(agent, env, example, max_steps, instruction, args, example_result_dir, scores, ledger=None):
     runtime_logger = setup_logger(example, example_result_dir)
     try:
         agent.reset(runtime_logger)
@@ -121,6 +121,10 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
 
             logger.info("Reward: %.2f", reward)
             logger.info("Done: %s", done)
+
+            if ledger is not None:
+                ledger.record_step(example.get("id", example_result_dir), obs.get("cur_app"), action, obs.get("exe_result", ""), step_idx + 1)
+
             # Save screenshot and trajectory information
             with open(os.path.join(example_result_dir, f"step_{step_idx + 1}_{action_timestamp}.png"),
                       "wb") as _f:
@@ -137,23 +141,27 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                     "screenshot_file": f"step_{step_idx + 1}_{action_timestamp}.png"
                 }))
                 f.write("\n")
-                
+
             if done:
                 logger.info("The episode is done.")
                 break
-        
+
         # Invalid Action
         if not actions:
             obs = env._get_obs() # update observation
-            
+
         step_idx += 1
-    
+
     if not done: # not completed the task yet
         env.action_history.append('FAIL')
-    
+
     result = env.evaluate()
     logger.info("Result: %.2f", result)
     scores.append(result)
+
+    if ledger is not None:
+        ledger.finalize_task(example.get("id", example_result_dir), success=result > 0)
+
     with open(os.path.join(example_result_dir, "result.txt"), "w", encoding="utf-8") as f:
         f.write(f"{result}\n")
     env.controller.end_recording(os.path.join(example_result_dir, "recording.mp4"))

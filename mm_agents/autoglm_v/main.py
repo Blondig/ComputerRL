@@ -74,9 +74,10 @@ class AutoGLMAgent:
         client_password="password",
         gen_func=None,
         tool_in_sys_msg: bool = True,
-        omni_data_dir=None, 
+        omni_data_dir=None,
         omni_llm_model="autoglm-os",
         omni_top_k: int = 5,
+        error_ledger=None,
     ):
         self.action_space = action_space
         self.observation_type = observation_type
@@ -98,6 +99,7 @@ class AutoGLMAgent:
         self._omni_llm_model = omni_llm_model
         self._omni_top_k = omni_top_k
         self._init_omni()
+        self.error_ledger = error_ledger
 
         self.tool_list = {
             "libreoffice_calc": "CalcTools",
@@ -142,6 +144,11 @@ class AutoGLMAgent:
         else:
             system_message = setup_prompt + "\n\n" + note_prompt
         system_message += "\n\n**IMPORTANT** You are asked to complete the following task: {}".format(instruction)
+
+        if self.error_ledger is not None and tool_name is not None:
+            error_context = self.error_ledger.retrieve(tool_name)
+            if error_context:
+                system_message += "\n\n" + error_context
 
         messages = [
             {
