@@ -88,7 +88,8 @@ class ErrorLedger:
         """Return a short prompt snippet of unresolved errors for this app."""
         if not app:
             return ""
-        relevant = [e for e in self.entries if e.get("app") == app and not e.get("resolved")]
+        # relevant = [e for e in self.entries if e.get("app") == app and not e.get("resolved")]
+        relevant = [e for e in self.entries if e.get("app") == app]
         if not relevant:
             return ""
 
