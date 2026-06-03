@@ -145,10 +145,21 @@ class AutoGLMAgent:
             system_message = setup_prompt + "\n\n" + note_prompt
         system_message += "\n\n**IMPORTANT** You are asked to complete the following task: {}".format(instruction)
 
+        # Cross-task memory injection. The backend decides *whether* to surface
+        # anything (v2 gates on the live context below); we only route the result.
+        mem_context, mem_target = "", "system"
         if self.error_ledger is not None and tool_name is not None:
-            error_context = self.error_ledger.retrieve(tool_name)
-            if error_context:
-                system_message += "\n\n" + error_context
+            recent_actions = [str(c.get("action", "")) for c in self.contents[-3:]]
+            mem_context = self.error_ledger.retrieve(
+                tool_name,
+                instruction=instruction,
+                last_result=last_result,
+                recent_actions=recent_actions,
+                step_idx=self.turn_number,
+            )
+            mem_target = getattr(self.error_ledger, "inject_target", "system")
+        if mem_context and mem_target == "system":
+            system_message += "\n\n" + mem_context
 
         messages = [
             {
@@ -183,6 +194,10 @@ class AutoGLMAgent:
         ) + (
             "\n\n" + func_def_prompt if not self.tool_in_sys_msg else ""
         )
+
+        # state-dependent memo (v2) rides in the user turn, not the system prompt
+        if mem_context and mem_target == "user":
+            prompt += "\n\n" + mem_context
 
         content = [{"type": "text", "text": prompt}]
         if self.with_image and obs.get('screenshot'):

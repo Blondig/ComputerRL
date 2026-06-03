@@ -56,6 +56,9 @@ class ErrorLedger:
         self.entries: list[dict] = self._load()
         self._current: list[dict] = []   # buffer for the running task
 
+    def count(self) -> int:
+        return len(self.entries)
+
     # ------------------------------------------------------------------
     # Recording
     # ------------------------------------------------------------------
@@ -97,8 +100,12 @@ class ErrorLedger:
     # Retrieval (called inside agent.prepare())
     # ------------------------------------------------------------------
 
-    def retrieve(self, app: Optional[str]) -> str:
-        """Return a short prompt snippet of unresolved errors for this app."""
+    def retrieve(self, app: Optional[str], **kwargs) -> str:
+        """Return a short prompt snippet of unresolved errors for this app.
+
+        v1 is the dumb baseline: it ignores the extra context kwargs
+        (instruction/last_result/recent_actions/step_idx) that v2 gates on.
+        Accepting **kwargs keeps the agent's retrieve() call site uniform across versions."""
         if not app:
             return ""
         app = normalize_app(app)
@@ -273,9 +280,12 @@ class ErrorLedgerV2:
             return ""
         recent_actions = recent_actions or []
 
-        # TTL: keep an already-selected memo active for a few steps without re-selecting
+        # TTL: keep an already-selected memo active for a few steps without re-selecting,
+        # but only while we are still in the same app it was selected for (an in-task
+        # app switch must drop it, otherwise a stale memo pollutes the new app's context).
         if self._active_memo is not None and self._active_memo_step is not None:
-            if step_idx - self._active_memo_step <= self.ttl_steps:
+            if (self._active_memo.get("app") == app
+                    and 0 <= step_idx - self._active_memo_step <= self.ttl_steps):
                 return self._format([self._active_memo])
             self._active_memo = None
             self._active_memo_step = None

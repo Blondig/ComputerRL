@@ -22,7 +22,7 @@ from tqdm import tqdm
 import lib_run_single
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
 from mm_agents.autoglm_v import AutoGLMAgent
-from mm_agents.error_ledger import ErrorLedger
+from mm_agents.error_ledger import make_error_ledger
 from typing import Optional, Dict, Any
 from openai import OpenAI
 
@@ -120,6 +120,16 @@ def config() -> argparse.Namespace:
     parser.add_argument("--omni_llm_model", type=str, default="autoglm-os")
     parser.add_argument("--error_ledger", type=str, default=None,
                         help="Path to error ledger JSON file. If set, enables cross-task error memory.")
+    parser.add_argument("--ledger_version", type=str, default="v1", choices=["v1", "v2"],
+                        help="v1: raw errors dumped into the system prompt (baseline). "
+                             "v2: deterministic gated structured error cards (MMSkills-style), "
+                             "injected into the user turn.")
+    parser.add_argument("--ledger_max_inject", type=int, default=1,
+                        help="v2 only: max error cards injected per step.")
+    parser.add_argument("--ledger_max_consults", type=int, default=1,
+                        help="v2 only: max times a given card may be (re)selected within one task.")
+    parser.add_argument("--ledger_ttl", type=int, default=4,
+                        help="v2 only: steps an injected card stays active before it can be dropped.")
     
     args = parser.parse_args()
 
@@ -431,9 +441,16 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         os_type="Ubuntu",
         require_a11y_tree=args.observation_type in ["a11y_tree", "screenshot_a11y_tree", "som"],
     )
-    ledger = ErrorLedger(args.error_ledger) if args.error_ledger else None
+    ledger = make_error_ledger(
+        args.error_ledger,
+        version=args.ledger_version,
+        max_inject=args.ledger_max_inject,
+        max_consults_per_task=args.ledger_max_consults,
+        ttl_steps=args.ledger_ttl,
+    ) if args.error_ledger else None
     if ledger:
-        logger.info(f"ErrorLedger enabled: {args.error_ledger} ({len(ledger.entries)} existing entries)")
+        logger.info(f"ErrorLedger[{args.ledger_version}] enabled: {args.error_ledger} "
+                    f"({ledger.count()} existing entries/cards)")
 
     agent = AutoGLMAgent(
         action_space=args.action_space,
