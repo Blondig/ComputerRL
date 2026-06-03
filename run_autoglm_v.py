@@ -120,14 +120,15 @@ def config() -> argparse.Namespace:
     parser.add_argument("--omni_llm_model", type=str, default="autoglm-os")
     parser.add_argument("--error_ledger", type=str, default=None,
                         help="Path to error ledger JSON file. If set, enables cross-task error memory.")
-    parser.add_argument("--ledger_version", type=str, default="v1", choices=["v1", "v2"],
+    parser.add_argument("--ledger_version", type=str, default="v1", choices=["v1", "v2", "v3"],
                         help="v1: raw errors dumped into the system prompt (baseline). "
                              "v2: deterministic gated structured error cards (MMSkills-style), "
-                             "injected into the user turn.")
+                             "injected into the user turn. "
+                             "v3: lightweight state-conditioned passive trajectory memory.")
     parser.add_argument("--ledger_max_inject", type=int, default=1,
-                        help="v2 only: max error cards injected per step.")
+                        help="v2/v3 only: max memory notes injected per step.")
     parser.add_argument("--ledger_max_consults", type=int, default=1,
-                        help="v2 only: max times a given card may be (re)selected within one task.")
+                        help="v2/v3 only: max times a given memory may be (re)selected within one task.")
     parser.add_argument("--ledger_ttl", type=int, default=4,
                         help="v2 only: steps an injected card stays active before it can be dropped.")
     

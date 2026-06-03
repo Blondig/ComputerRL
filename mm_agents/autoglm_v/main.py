@@ -156,6 +156,7 @@ class AutoGLMAgent:
                 last_result=last_result,
                 recent_actions=recent_actions,
                 step_idx=self.turn_number,
+                obs=obs,
             )
             mem_target = getattr(self.error_ledger, "inject_target", "system")
         if mem_context and mem_target == "system":

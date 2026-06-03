@@ -117,13 +117,29 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
             # Capture the timestamp before executing the action
             action_timestamp = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
             logger.info("Step %d: %s", step_idx + 1, action)
+            pre_obs = obs
             obs, reward, done, info = env.step(action, args.sleep_after_execution)
 
             logger.info("Reward: %.2f", reward)
             logger.info("Done: %s", done)
 
             if ledger is not None:
-                ledger.record_step(example.get("id", example_result_dir), obs.get("cur_app"), action, obs.get("exe_result", ""), step_idx + 1)
+                task_id = example.get("id", example_result_dir)
+                if hasattr(ledger, "record_transition"):
+                    ledger.record_transition(
+                        task_id=task_id,
+                        instruction=instruction,
+                        response=response,
+                        action=action,
+                        pre_obs=pre_obs,
+                        post_obs=obs,
+                        reward=reward,
+                        done=done,
+                        info=info,
+                        step_idx=step_idx + 1,
+                    )
+                else:
+                    ledger.record_step(task_id, obs.get("cur_app"), action, obs.get("exe_result", ""), step_idx + 1)
 
             # Save screenshot and trajectory information
             with open(os.path.join(example_result_dir, f"step_{step_idx + 1}_{action_timestamp}.png"),
@@ -135,6 +151,7 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                     "action_timestamp": action_timestamp,
                     "action": action,
                     "response": response,
+                    "exe_result": obs.get("exe_result", ""),
                     "reward": reward,
                     "done": done,
                     "info": info,

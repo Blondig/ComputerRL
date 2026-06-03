@@ -18,6 +18,8 @@ import json
 import os
 import re
 import logging
+import hashlib
+from collections import Counter
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger("desktopenv.error_ledger")
@@ -47,6 +49,142 @@ def normalize_app(app: Optional[str]) -> str:
     if not app:
         return ""
     return app.strip().lower().replace("-", "_")
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:#-]{2,}")
+_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "into", "your", "you",
+    "are", "was", "were", "will", "have", "has", "had", "none", "true", "false",
+}
+
+
+def _short_hash(text: str, length: int = 12) -> str:
+    return hashlib.sha1((text or "").encode("utf-8", errors="ignore")).hexdigest()[:length]
+
+
+def _tokenize(text: str, max_tokens: int = 80) -> List[str]:
+    counts = Counter(
+        tok.lower()
+        for tok in _TOKEN_RE.findall(text or "")
+        if tok.lower() not in _STOPWORDS and len(tok) <= 48
+    )
+    return [tok for tok, _count in counts.most_common(max_tokens)]
+
+
+def _overlap_score(query_tokens: List[str], memory_tokens: List[str]) -> float:
+    if not query_tokens or not memory_tokens:
+        return 0.0
+    q, m = set(query_tokens), set(memory_tokens)
+    return len(q & m) / max(1, min(len(q), len(m)))
+
+
+def _active_title(obs: Optional[dict]) -> str:
+    if not obs:
+        return ""
+    apps = obs.get("apps") or {}
+    cur_id = obs.get("cur_window_id")
+    if cur_id in apps:
+        return str(apps[cur_id].get("title", ""))[:160]
+    return ""
+
+
+def summarize_observation(obs: Optional[dict]) -> dict:
+    """Lightweight, non-visual state abstraction for v3 trajectory memory.
+
+    It intentionally avoids screenshot embeddings and raw screenshot storage.
+    The signature is conservative: good enough for high-precision retrieval,
+    not intended to be a full GUI state identity system.
+    """
+    obs = obs or {}
+    app = normalize_app(obs.get("cur_app"))
+    title = _active_title(obs)
+    app_info = str(obs.get("app_info") or "")
+    tree = str(obs.get("accessibility_tree") or "")
+
+    token_text = " ".join([
+        app,
+        title,
+        app_info[:5000],
+        tree[:5000],
+    ])
+    tokens = _tokenize(token_text, max_tokens=80)
+
+    sig_src = "\n".join([
+        app,
+        title.lower(),
+        " ".join(tokens[:60]),
+        _short_hash(app_info[:5000]),
+    ])
+    return {
+        "app": app or "unknown",
+        "title": title,
+        "tokens": tokens,
+        "state_sig": _short_hash(sig_src),
+        "app_info_hash": _short_hash(app_info[:5000]),
+        "a11y_hash": _short_hash(tree[:5000]),
+    }
+
+
+# High-level tool calls the agent emits in its response, e.g. CalcTools.set_value(,
+# ImpressTools.add_text(, BrowserTools.open_tab(, Agent.click(. These carry real
+# semantics; the grounded action that actually runs is a coarse pyautogui verb.
+_HIGH_LEVEL_CALL_RE = re.compile(r"((?:\w*Tools|Agent)\.\w+)\s*\(")
+
+# Actions that are not part of a procedure's "shape". For this agent,
+# procedural_memory documents `Agent.exit(success=True)` as the canonical "done"
+# and `Agent.wait()` as wait.
+#   _WAIT_SIGS  : non-semantic pauses -> dropped, but they do NOT break a run
+#                 (open_url -> wait -> click is the same procedure as open_url ->
+#                 click; the agent waits reactively from the live screen anyway).
+#   _BREAK_SIGS : real discontinuities -> they break a run, so a snippet never
+#                 stitches across them (this also keeps Agent.exit out of every
+#                 "successful pattern", which would otherwise train premature exit).
+_WAIT_SIGS = {"WAIT", "Agent.wait"}
+_BREAK_SIGS = {"unknown", "DONE", "FAIL", "Agent.exit"}
+
+
+def _executed_code(response: str) -> str:
+    """Return only the code the agent actually executes.
+
+    Responses look like ``<think>{plan}</think><answer>```python\\n{ONE-LINE}\\n```</answer>``.
+    The <think> section is free-form planning that may *mention* other tool calls, so
+    extracting from the whole response can record a planned call instead of the
+    executed one. Restrict to the final <answer> code block (fall back gracefully).
+    """
+    if not response:
+        return ""
+    tail = response.rsplit("<answer>", 1)[-1]   # after the last <answer>, else the whole text
+    blocks = re.findall(r"```(?:\w+\s*)?(.*?)```", tail, re.DOTALL)
+    if blocks:
+        return blocks[-1]
+    return tail
+
+
+def _action_signature(action, response: str = "") -> str:
+    """Canonical action label for trajectory memory.
+
+    Prefer the high-level tool call the agent actually executes in the <answer>
+    code block (e.g. ``CalcTools.set_value``). The grounded ``action`` that gets
+    executed is usually a coarse ``pyautogui.{click,write,hotkey}`` that collapses
+    every distinct operation into ~3 buckets, which starves all three memory banks.
+    """
+    if response:
+        m = _HIGH_LEVEL_CALL_RE.search(_executed_code(response))
+        if m:
+            return m.group(1)
+    api_call = _extract_api_call(action)
+    if api_call != "unknown":
+        return api_call
+    text = str(action or "")
+    if text in {"WAIT", "DONE", "FAIL"}:
+        return text
+    if "pyautogui.hotkey" in text:
+        return "pyautogui.hotkey"
+    if "pyautogui.click" in text:
+        return "pyautogui.click"
+    if "pyautogui.write" in text:
+        return "pyautogui.write"
+    return "unknown"
 
 
 class ErrorLedger:
@@ -355,15 +493,399 @@ class ErrorLedgerV2:
 
 
 # ======================================================================
+# v3 -- state-conditioned passive trajectory memory.
+# ======================================================================
+
+class ErrorLedgerV3:
+    """Lightweight cross-task trajectory memory from passive rollouts.
+
+    v3 deliberately avoids active exploration, embeddings, model training, and
+    MCTS. It keeps the v1/v2 public retrieval interface, but records richer
+    transition context when the runner provides it:
+
+        pre_state -> action_signature -> post_state
+
+    The memory bank is intentionally small and conservative:
+      * error_notes: risky actions in similar states
+      * success_snippets: short successful action-signature patterns
+      * action_stats: next-state dispersion for ambiguity warnings
+    """
+
+    inject_target = "user"
+
+    def __init__(self, ledger_path: str, max_inject: int = 2,
+                 max_consults_per_task: int = 1, ttl_steps: int = 4):
+        self.ledger_path = ledger_path
+        base, _ext = os.path.splitext(ledger_path)
+        self.memory_path = base + ".v3.json"
+        self.audit_path = base + ".v3.audit.jsonl"
+        self.max_inject = max_inject
+        self.max_consults_per_task = max_consults_per_task
+        self.ttl_steps = ttl_steps
+
+        self.memory: Dict[str, Any] = self._load_memory()
+        self._steps: List[dict] = []
+        self._task_consults: Dict[str, int] = {}
+
+    def count(self) -> int:
+        return (
+            len(self.memory.get("error_notes", {}))
+            + len(self.memory.get("success_snippets", {}))
+            + len(self.memory.get("action_stats", {}))
+        )
+
+    def record_step(self, task_id: str, app: Optional[str], action, exe_result: str, step_idx: int):
+        """Compatibility fallback. The v3 runner should call record_transition."""
+        if not exe_result or not _is_error(exe_result):
+            return
+        app = normalize_app(app) or "unknown"
+        state = {"app": app, "tokens": [], "state_sig": "unknown", "title": ""}
+        self._steps.append({
+            "task_id": task_id,
+            "app": app,
+            "step_idx": step_idx,
+            "pre": state,
+            "post": state,
+            "action_sig": _action_signature(action),
+            "action_text": str(action)[:1000],
+            "response": "",
+            "exe_result": (exe_result or "")[:1000],
+            "is_error": True,
+            "done": False,
+        })
+
+    def record_transition(self, task_id: str, instruction: str, response: str, action,
+                          pre_obs: dict, post_obs: dict, reward: float = 0.0,
+                          done: bool = False, info: Optional[dict] = None,
+                          step_idx: int = 0):
+        pre = summarize_observation(pre_obs)
+        post = summarize_observation(post_obs)
+        exe_result = (post_obs or {}).get("exe_result", "") or ""
+        action_sig = _action_signature(action, response)
+        self._steps.append({
+            "task_id": task_id,
+            "instruction": instruction or "",
+            "task_tokens": _tokenize(instruction or "", max_tokens=40),
+            "app": pre.get("app") or post.get("app") or "unknown",
+            "step_idx": step_idx,
+            "pre": pre,
+            "post": post,
+            "action_sig": action_sig,
+            "action_text": str(action)[:1000],
+            "response": (response or "")[:1200],
+            "exe_result": exe_result[:1000],
+            "is_error": _is_error(exe_result),
+            "done": bool(done),
+            "info": info or {},
+            "reward": reward,
+        })
+
+    def finalize_task(self, task_id: str, success: bool):
+        if not self._steps:
+            self._task_consults = {}
+            return
+
+        self._append_audit(task_id, success, self._steps)
+        for step in self._steps:
+            self._upsert_action_stats(step)
+            if step.get("is_error"):
+                self._upsert_error_note(step, task_id, success)
+        if success:
+            self._upsert_success_snippets(task_id)
+
+        self._save_memory()
+        logger.info(
+            "ErrorLedgerV3: finalized %s success=%s steps=%d memory=%d",
+            task_id, success, len(self._steps), self.count()
+        )
+        self._steps = []
+        self._task_consults = {}
+
+    def retrieve(self, app: Optional[str], instruction: str = "", last_result: str = "",
+                 recent_actions: Optional[list] = None, step_idx: int = 0,
+                 obs: Optional[dict] = None, **kwargs) -> str:
+        app = normalize_app(app)
+        if not app:
+            return ""
+        current = summarize_observation(obs)
+        query_tokens = current.get("tokens", [])
+        if not query_tokens:
+            return ""
+
+        notes = []
+        notes.extend(self._retrieve_error_notes(app, current, recent_actions or []))
+        notes.extend(self._retrieve_success_snippets(app, current, instruction))
+        notes.extend(self._retrieve_ambiguity_notes(app, current, recent_actions or []))
+        if not notes:
+            return ""
+
+        notes.sort(key=lambda item: item["score"], reverse=True)
+        selected = []
+        for item in notes:
+            mid = item["id"]
+            if self._task_consults.get(mid, 0) >= self.max_consults_per_task:
+                continue
+            self._task_consults[mid] = self._task_consults.get(mid, 0) + 1
+            selected.append(item)
+            if len(selected) >= self.max_inject:
+                break
+        if not selected:
+            return ""
+        return self._format(selected)
+
+    # ----- memory builders --------------------------------------------
+
+    def _upsert_error_note(self, step: dict, task_id: str, success: bool):
+        pre = step.get("pre", {})
+        action_sig = step.get("action_sig", "unknown")
+        key = "ERR|{app}|{state}|{action}".format(
+            app=step.get("app", "unknown"),
+            state=pre.get("state_sig", "unknown"),
+            action=action_sig,
+        )
+        notes = self.memory.setdefault("error_notes", {})
+        note = notes.setdefault(key, {
+            "id": key,
+            "app": step.get("app", "unknown"),
+            "state_sig": pre.get("state_sig", "unknown"),
+            "state_tokens": pre.get("tokens", [])[:80],
+            "title": pre.get("title", ""),
+            "action_sig": action_sig,
+            "failure_type": "execution_error",
+            "example_result": "",
+            "support_count": 0,
+            "last_task_success": False,
+            "last_seen_task": "",
+        })
+        note["support_count"] += 1
+        note["example_result"] = step.get("exe_result", "")[:240]
+        note["last_task_success"] = bool(success)
+        note["last_seen_task"] = task_id
+
+    def _upsert_success_snippets(self, task_id: str):
+        # Split the trajectory into runs of consecutive real actions, then window
+        # WITHIN each run. Waits are non-semantic pauses: dropped, but they do NOT
+        # break a run (open_url -> wait -> click stays open_url -> click; the agent
+        # waits reactively from the live screen anyway). Errors / terminals /
+        # unrecognized actions DO break a run -- stitching across them would
+        # fabricate an adjacency that was never taken (e.g. promoting a context-
+        # dependent recovery step into the "always-do" procedure).
+        runs: List[List[dict]] = []
+        run: List[dict] = []
+        for s in self._steps:
+            sig = s.get("action_sig", "unknown")
+            if s.get("is_error") or sig in _BREAK_SIGS:
+                if run:
+                    runs.append(run)
+                    run = []
+            elif sig in _WAIT_SIGS:
+                continue            # drop the pause, keep the run going
+            else:
+                run.append(s)
+        if run:
+            runs.append(run)
+
+        snippets = self.memory.setdefault("success_snippets", {})
+        for seg in runs:
+            for start in range(len(seg)):
+                for length in (2, 3):
+                    window = seg[start:start + length]
+                    if len(window) < length:
+                        continue
+                    app = window[0].get("app", "unknown")
+                    if any(s.get("app") != app for s in window):
+                        continue
+                    actions = [s.get("action_sig", "unknown") for s in window]
+                    key = "SUC|{app}|{actions}".format(app=app, actions=">".join(actions))
+                    pre = window[0].get("pre", {})
+                    task_tokens = window[0].get("task_tokens", [])
+                    snippet = snippets.setdefault(key, {
+                        "id": key,
+                        "app": app,
+                        "action_sigs": actions,
+                        "state_tokens": pre.get("tokens", [])[:80],
+                        "task_tokens": task_tokens[:40],
+                        "support_count": 0,
+                        "last_seen_task": "",
+                    })
+                    snippet["support_count"] += 1
+                    snippet["last_seen_task"] = task_id
+                    # Keep a small union so retrieval can generalize without drifting too far.
+                    merged_tokens = list(dict.fromkeys(
+                        snippet.get("state_tokens", []) + pre.get("tokens", [])[:40]
+                    ))
+                    snippet["state_tokens"] = merged_tokens[:80]
+
+    def _upsert_action_stats(self, step: dict):
+        pre = step.get("pre", {})
+        post = step.get("post", {})
+        action_sig = step.get("action_sig", "unknown")
+        if action_sig in {"unknown", "WAIT"}:
+            return
+        key = "ACT|{app}|{state}|{action}".format(
+            app=step.get("app", "unknown"),
+            state=pre.get("state_sig", "unknown"),
+            action=action_sig,
+        )
+        stats = self.memory.setdefault("action_stats", {})
+        stat = stats.setdefault(key, {
+            "id": key,
+            "app": step.get("app", "unknown"),
+            "state_sig": pre.get("state_sig", "unknown"),
+            "state_tokens": pre.get("tokens", [])[:80],
+            "action_sig": action_sig,
+            "next_states": {},
+            "support_count": 0,
+        })
+        next_sig = post.get("state_sig", "unknown")
+        stat["next_states"][next_sig] = stat["next_states"].get(next_sig, 0) + 1
+        stat["support_count"] += 1
+
+    # ----- retrieval ---------------------------------------------------
+
+    def _retrieve_error_notes(self, app: str, current: dict, recent_actions: List[str]) -> List[dict]:
+        results = []
+        recent_text = " ".join(recent_actions or [])
+        for note in self.memory.get("error_notes", {}).values():
+            if note.get("app") != app:
+                continue
+            score = self._state_score(current, note)
+            if note.get("action_sig") and note.get("action_sig") in recent_text:
+                score += 0.25
+            if score < 0.38:
+                continue
+            results.append({
+                "id": note["id"],
+                "kind": "risk",
+                "score": score + min(note.get("support_count", 1), 3) * 0.03,
+                "text": (
+                    "Risk in similar state: action {action} previously failed. "
+                    "Check target/selection first; result was: {result}"
+                ).format(
+                    action=note.get("action_sig", "unknown"),
+                    result=(note.get("example_result") or "unknown")[:180],
+                ),
+            })
+        return results
+
+    def _retrieve_success_snippets(self, app: str, current: dict, instruction: str) -> List[dict]:
+        results = []
+        instruction_tokens = _tokenize(instruction or "", max_tokens=40)
+        for snippet in self.memory.get("success_snippets", {}).values():
+            if snippet.get("app") != app:
+                continue
+            state_score = self._state_score(current, snippet)
+            task_score = _overlap_score(instruction_tokens, snippet.get("task_tokens", []))
+            score = state_score + 0.3 * task_score + min(snippet.get("support_count", 1), 3) * 0.03
+            if score < 0.42:
+                continue
+            results.append({
+                "id": snippet["id"],
+                "kind": "success",
+                "score": score,
+                "text": (
+                    "Similar successful short pattern: {actions}. "
+                    "Use it only as a proposal and adapt all arguments to the current task."
+                ).format(actions=" -> ".join(snippet.get("action_sigs", []))),
+            })
+        return results
+
+    def _retrieve_ambiguity_notes(self, app: str, current: dict, recent_actions: List[str]) -> List[dict]:
+        results = []
+        recent_text = " ".join(recent_actions or [])
+        for stat in self.memory.get("action_stats", {}).values():
+            if stat.get("app") != app:
+                continue
+            next_states = stat.get("next_states", {})
+            if len(next_states) < 2 or stat.get("support_count", 0) < 3:
+                continue
+            score = self._state_score(current, stat)
+            if stat.get("action_sig") in recent_text:
+                score += 0.15
+            if score < 0.45:
+                continue
+            results.append({
+                "id": stat["id"],
+                "kind": "ambiguity",
+                "score": score,
+                "text": (
+                    "Ambiguity warning: in similar states, action {action} led to "
+                    "{n} different next states. Verify the current target/state before "
+                    "continuing or calling DONE."
+                ).format(action=stat.get("action_sig", "unknown"), n=len(next_states)),
+            })
+        return results
+
+    def _state_score(self, current: dict, item: dict) -> float:
+        if current.get("state_sig") == item.get("state_sig"):
+            return 1.0
+        return _overlap_score(current.get("tokens", []), item.get("state_tokens", []))
+
+    def _format(self, items: List[dict]) -> str:
+        lines = [
+            "* Cross-task Trajectory Memory (v3):",
+            "Use these notes only if they match the current screen and task. "
+            "They are passive memories from prior rollouts, not guaranteed commands.",
+        ]
+        for item in items:
+            lines.append(f"- {item['text']}")
+        return "\n".join(lines)
+
+    # ----- persistence -------------------------------------------------
+
+    def _empty_memory(self) -> Dict[str, Any]:
+        return {
+            "error_notes": {},
+            "success_snippets": {},
+            "action_stats": {},
+        }
+
+    def _load_memory(self) -> Dict[str, Any]:
+        if os.path.exists(self.memory_path):
+            try:
+                with open(self.memory_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                base = self._empty_memory()
+                base.update(data if isinstance(data, dict) else {})
+                return base
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"ErrorLedgerV3: failed to load {self.memory_path}: {e}")
+        return self._empty_memory()
+
+    def _save_memory(self):
+        try:
+            tmp_path = self.memory_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.memory, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, self.memory_path)
+        except IOError as e:
+            logger.error(f"ErrorLedgerV3: failed to save {self.memory_path}: {e}")
+
+    def _append_audit(self, task_id: str, success: bool, steps: List[dict]):
+        try:
+            with open(self.audit_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "task_id": task_id,
+                    "success": bool(success),
+                    "steps": steps,
+                }, ensure_ascii=False) + "\n")
+        except IOError as e:
+            logger.error(f"ErrorLedgerV3: failed to append audit {self.audit_path}: {e}")
+
+
+# ======================================================================
 # factory
 # ======================================================================
 
 def make_error_ledger(path: str, version: str = "v1", max_inject: int = 1,
                       max_consults_per_task: int = 1, ttl_steps: int = 4):
-    """v1 keeps its original defaults (max_inject=5, system injection).
-    v2 tunables only apply to v2."""
+    """v1 keeps its original defaults (max_inject=5, system injection)."""
     if version == "v2":
         return ErrorLedgerV2(path, max_inject=max_inject,
+                             max_consults_per_task=max_consults_per_task,
+                             ttl_steps=ttl_steps)
+    if version == "v3":
+        return ErrorLedgerV3(path, max_inject=max_inject,
                              max_consults_per_task=max_consults_per_task,
                              ttl_steps=ttl_steps)
     return ErrorLedger(path)
