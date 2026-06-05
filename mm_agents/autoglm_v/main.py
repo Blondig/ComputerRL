@@ -155,7 +155,9 @@ class AutoGLMAgent:
                 instruction=instruction,
                 last_result=last_result,
                 recent_actions=recent_actions,
-                step_idx=self.turn_number,
+                # +1 so the logged step_idx matches lib_run_single's record (step_idx+1),
+                # i.e. the injection on this turn aligns with the transition it precedes.
+                step_idx=self.turn_number + 1,
                 obs=obs,
             )
             mem_target = getattr(self.error_ledger, "inject_target", "system")

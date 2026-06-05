@@ -96,6 +96,8 @@ def run_single_example_human(env, example, max_steps, instruction, args, example
 
 def run_single_example_autoglm(agent, env, example, max_steps, instruction, args, example_result_dir, scores, ledger=None):
     runtime_logger = setup_logger(example, example_result_dir)
+    if ledger is not None and hasattr(ledger, "reset_task"):
+        ledger.reset_task()   # drop buffers left dirty by a prior task that crashed before finalize
     try:
         agent.reset(runtime_logger)
     except Exception as e:

@@ -39,7 +39,11 @@ def _is_error(exe_result: str) -> bool:
 def _extract_api_call(action) -> str:
     if isinstance(action, dict):
         return action.get("action_type", "unknown")
-    m = re.search(r'(\w+\.\w+)\s*\(', str(action))
+    # str(action) may carry literal "\n"/"\t" escape sequences (a stray backslash-n,
+    # not a real newline); the \w+ then swallows the leading char -> "nCalcTools.save".
+    # Unescape to real whitespace first so the extracted call name is clean.
+    text = str(action).replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
+    m = re.search(r'(\w+\.\w+)\s*\(', text)
     return m.group(1) if m else "unknown"
 
 
@@ -154,7 +158,10 @@ def _executed_code(response: str) -> str:
     if not response:
         return ""
     tail = response.rsplit("<answer>", 1)[-1]   # after the last <answer>, else the whole text
-    blocks = re.findall(r"```(?:\w+\s*)?(.*?)```", tail, re.DOTALL)
+    # `\s+` (not `\s*`): a markdown language tag is a word followed by whitespace.
+    # With `\s*`, an untagged single-line block ```CalcTools.save()``` would have
+    # "CalcTools" eaten as the "tag", leaving ".save()" and losing the call name.
+    blocks = re.findall(r"```(?:\w+\s+)?(.*?)```", tail, re.DOTALL)
     if blocks:
         return blocks[-1]
     return tail
@@ -312,6 +319,7 @@ class ErrorLedgerV2:
         self._task_consults: Dict[str, int] = {}     # memory_id -> consults this task
         self._active_memo: Optional[dict] = None
         self._active_memo_step: Optional[int] = None
+        self._injected: List[dict] = []          # {step_idx, memory_id} surfaced this task
 
     def count(self) -> int:
         return len(self.cards)
@@ -329,22 +337,29 @@ class ErrorLedgerV2:
             "is_error": _is_error(exe_result),
         })
 
+    def reset_task(self):
+        """Drop per-task buffers. Called at task start so a task that crashed before
+        finalize_task() cannot leak its steps/injections into the next task's audit."""
+        self._steps = []
+        self._task_consults = {}
+        self._active_memo = None
+        self._active_memo_step = None
+        self._injected = []
+
     # ----- finalize: build/refresh templated cards + audit dump -------
     def finalize_task(self, task_id: str, success: bool):
         if self._steps:
-            # audit: persist the full step trace (raw material for a future v3 distill)
-            self._append_audit(task_id, success, self._steps)
+            # audit: persist the full step trace + what the ledger injected this task
+            self._append_audit(task_id, success, self._steps, self._injected)
             for s in self._steps:
                 if s["is_error"]:
                     self._upsert_card(s, task_id, success)
             self._save_cards()
             logger.info(f"ErrorLedgerV2: finalized {task_id} success={success} "
-                        f"steps={len(self._steps)} cards={len(self.cards)}")
+                        f"steps={len(self._steps)} cards={len(self.cards)} "
+                        f"injected={len(self._injected)}")
         # reset per-task state UNCONDITIONALLY (consult cap / active memo are per-task)
-        self._steps = []
-        self._task_consults = {}
-        self._active_memo = None
-        self._active_memo_step = None
+        self.reset_task()
 
     def _memory_id(self, app: str, api_call: str) -> str:
         return f"ERR_{app}_{api_call}".replace(".", "_")
@@ -424,6 +439,9 @@ class ErrorLedgerV2:
         if self._active_memo is not None and self._active_memo_step is not None:
             if (self._active_memo.get("app") == app
                     and 0 <= step_idx - self._active_memo_step <= self.ttl_steps):
+                self._injected.append({"step_idx": step_idx,
+                                       "memory_id": self._active_memo["memory_id"],
+                                       "ttl_repeat": True})
                 return self._format([self._active_memo])
             self._active_memo = None
             self._active_memo_step = None
@@ -442,6 +460,7 @@ class ErrorLedgerV2:
 
         for c in chosen:
             self._task_consults[c["memory_id"]] = self._task_consults.get(c["memory_id"], 0) + 1
+            self._injected.append({"step_idx": step_idx, "memory_id": c["memory_id"]})
         self._active_memo = chosen[0]
         self._active_memo_step = step_idx
         return self._format(chosen)
@@ -483,11 +502,13 @@ class ErrorLedgerV2:
         except IOError as e:
             logger.error(f"ErrorLedgerV2: failed to save {self.cards_path}: {e}")
 
-    def _append_audit(self, task_id: str, success: bool, steps: List[dict]):
+    def _append_audit(self, task_id: str, success: bool, steps: List[dict],
+                      injected: Optional[List[dict]] = None):
         try:
             with open(self.audit_path, "a") as f:
                 f.write(json.dumps({"task_id": task_id, "success": bool(success),
-                                    "steps": steps}, ensure_ascii=False) + "\n")
+                                    "steps": steps, "injected": injected or []},
+                                   ensure_ascii=False) + "\n")
         except IOError as e:
             logger.error(f"ErrorLedgerV2: failed to append audit {self.audit_path}: {e}")
 
@@ -526,6 +547,7 @@ class ErrorLedgerV3:
         self.memory: Dict[str, Any] = self._load_memory()
         self._steps: List[dict] = []
         self._task_consults: Dict[str, int] = {}
+        self._injected: List[dict] = []          # {step_idx, memory_id, kind} surfaced this task
 
     def count(self) -> int:
         return (
@@ -580,12 +602,18 @@ class ErrorLedgerV3:
             "reward": reward,
         })
 
+    def reset_task(self):
+        """Drop per-task buffers (see ErrorLedgerV2.reset_task)."""
+        self._steps = []
+        self._task_consults = {}
+        self._injected = []
+
     def finalize_task(self, task_id: str, success: bool):
         if not self._steps:
-            self._task_consults = {}
+            self.reset_task()
             return
 
-        self._append_audit(task_id, success, self._steps)
+        self._append_audit(task_id, success, self._steps, self._injected)
         for step in self._steps:
             self._upsert_action_stats(step)
             if step.get("is_error"):
@@ -595,11 +623,10 @@ class ErrorLedgerV3:
 
         self._save_memory()
         logger.info(
-            "ErrorLedgerV3: finalized %s success=%s steps=%d memory=%d",
-            task_id, success, len(self._steps), self.count()
+            "ErrorLedgerV3: finalized %s success=%s steps=%d memory=%d injected=%d",
+            task_id, success, len(self._steps), self.count(), len(self._injected)
         )
-        self._steps = []
-        self._task_consults = {}
+        self.reset_task()
 
     def retrieve(self, app: Optional[str], instruction: str = "", last_result: str = "",
                  recent_actions: Optional[list] = None, step_idx: int = 0,
@@ -627,6 +654,8 @@ class ErrorLedgerV3:
                 continue
             self._task_consults[mid] = self._task_consults.get(mid, 0) + 1
             selected.append(item)
+            self._injected.append({"step_idx": step_idx, "memory_id": mid,
+                                   "kind": item.get("kind")})
             if len(selected) >= self.max_inject:
                 break
         if not selected:
@@ -861,13 +890,15 @@ class ErrorLedgerV3:
         except IOError as e:
             logger.error(f"ErrorLedgerV3: failed to save {self.memory_path}: {e}")
 
-    def _append_audit(self, task_id: str, success: bool, steps: List[dict]):
+    def _append_audit(self, task_id: str, success: bool, steps: List[dict],
+                      injected: Optional[List[dict]] = None):
         try:
             with open(self.audit_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({
                     "task_id": task_id,
                     "success": bool(success),
                     "steps": steps,
+                    "injected": injected or [],
                 }, ensure_ascii=False) + "\n")
         except IOError as e:
             logger.error(f"ErrorLedgerV3: failed to append audit {self.audit_path}: {e}")
