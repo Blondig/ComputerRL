@@ -24,6 +24,7 @@ import argparse
 import glob
 import json
 import os
+from collections import Counter
 from math import comb
 
 
@@ -70,17 +71,26 @@ def load_instruction(eval_base, domain, task_id):
 
 
 def load_audit(path):
-    """Return (per_task, order) where per_task[task_id] holds availability proxies.
+    """Return (per_task, order, has_injected).
 
-    Audit lines are appended in run order, so a card for (app, api_call) only exists
-    for tasks that come AFTER the task that first errored on it.
+    Two cross-references per task:
+      * DEFINITIVE -- the `injected` field (memory_ids the ledger actually surfaced),
+        present in v2/v3 audits written after the injection-log change.
+      * PROXY (fallback for older audits) -- whether a relevant card was *available*
+        when the task ran. Audit lines are in run order, so a card for (app, sig)
+        only exists for tasks after the one that first errored on it.
+    v2 steps key the action as `api_call`; v3 steps use `action_sig` -> handle both.
     """
-    per_task, order = {}, []
-    carded = set()                      # (app, api_call) that have errored so far
+    per_task, order, has_injected = {}, [], False
+    carded = set()
+
+    def _sig(s):
+        return s.get("api_call") or s.get("action_sig")
+
     try:
         lines = open(path).read().splitlines()
     except OSError:
-        return {}, []
+        return {}, [], False
     for line in lines:
         line = line.strip()
         if not line:
@@ -93,12 +103,18 @@ def load_audit(path):
         steps = d.get("steps", []) or []
         apps = [s.get("app") for s in steps]
         app = max(set(apps), key=apps.count) if apps else "unknown"
-        api_calls = {s.get("api_call") for s in steps if s.get("api_call")}
-        err_calls = sorted({s.get("api_call") for s in steps if s.get("is_error")})
+        sigs = {_sig(s) for s in steps if _sig(s)}
+        err_calls = sorted({_sig(s) for s in steps if s.get("is_error") and _sig(s)})
 
-        # availability is judged BEFORE this task's own errors are added to the bank
+        # proxy: availability is judged BEFORE this task's own errors enter the bank
         cards_for_app = sum(1 for (a, _c) in carded if a == app)
-        relevant_hit = any((app, c) in carded for c in api_calls)
+        relevant_hit = any((app, c) in carded for c in sigs)
+
+        # definitive: what the ledger actually injected this task (None = old audit)
+        injected = d.get("injected", None)
+        if injected is not None:
+            has_injected = True
+        inj_list = injected or []
 
         per_task[tid] = {
             "n_steps": len(steps),
@@ -106,12 +122,15 @@ def load_audit(path):
             "err_calls": err_calls,
             "cards_for_app_before": cards_for_app,
             "relevant_card_available": relevant_hit,
+            "n_injected": len(inj_list),
+            "injected_ids": sorted({i.get("memory_id") for i in inj_list if i.get("memory_id")}),
+            "injected_kinds": sorted({i.get("kind") for i in inj_list if i.get("kind")}),
         }
         order.append(tid)
         for s in steps:
-            if s.get("is_error") and s.get("api_call"):
-                carded.add((app, s.get("api_call")))
-    return per_task, order
+            if s.get("is_error") and _sig(s):
+                carded.add((app, _sig(s)))
+    return per_task, order, has_injected
 
 
 # ----------------------------------------------------------------------
@@ -195,7 +214,12 @@ def main():
     print(f"  McNemar exact two-sided p = {p:.3f}   ->  {verdict}  (discordant n={b+c})")
 
     # ---- per-task detail + memory-availability proxy ----
-    audit, _order = load_audit(args.audit) if args.audit else ({}, [])
+    audit, _order, has_inj = load_audit(args.audit) if args.audit else ({}, [], False)
+
+    if has_inj and audit:
+        fired = sum(1 for t in both if audit.get(t, {}).get("n_injected", 0) > 0)
+        print(f"\nMemory fired (>=1 injection) on {fired}/{len(both)} paired tasks "
+              f"(if ~0, retrieval barely triggered -- the condition is near-dormant).")
 
     def show(tasks, header):
         if not tasks:
@@ -207,26 +231,39 @@ def main():
             line = f"  {t}  [base={base[t]['score']:.2f} v2={v2[t]['score']:.2f}]  {instr}"
             if t in audit:
                 a = audit[t]
-                rel = "RELEVANT-card-available" if a["relevant_card_available"] else "no-relevant-card"
-                line += (f"\n        audit: steps={a['n_steps']} errors={a['n_errors']} "
-                         f"cards_for_app_before={a['cards_for_app_before']} -> {rel}"
-                         + (f" | errored on: {a['err_calls']}" if a["err_calls"] else ""))
+                if has_inj:
+                    if a["n_injected"]:
+                        line += (f"\n        INJECTED: {a['injected_ids']}"
+                                 + (f"  kinds={a['injected_kinds']}" if a["injected_kinds"] else ""))
+                    else:
+                        line += "\n        INJECTED: (nothing this task)"
+                else:
+                    rel = "RELEVANT-card-available" if a["relevant_card_available"] else "no-relevant-card"
+                    line += (f"\n        audit(proxy): steps={a['n_steps']} errors={a['n_errors']} "
+                             f"cards_for_app_before={a['cards_for_app_before']} -> {rel}"
+                             + (f" | errored on: {a['err_calls']}" if a["err_calls"] else ""))
             print(line)
 
-    show(v2_only, ">>> v2 FIXED these (the source of the gain):")
-    show(base_only, ">>> v2 BROKE these (regressions -- watch these):")
+    show(v2_only, ">>> FIXED these (the source of the gain):")
+    show(base_only, ">>> BROKE these (regressions -- watch these):")
 
     if audit and v2_only:
-        rel = sum(1 for t in v2_only if audit.get(t, {}).get("relevant_card_available"))
-        print(f"\nMemory-availability proxy on the {c} fixed tasks: "
-              f"{rel}/{c} had a directly relevant card available when they ran.")
-        print("  NOTE: 'available' != 'injected' (the gate depends on the instruction/last-result,")
-        print("        which the audit does not store) and 'injected' != 'caused'. Treat this as an")
-        print("        UPPER BOUND on how many wins the memory could plausibly explain.")
-        if rel == 0:
-            print("  -> 0 relevant cards on the fixed tasks => the +gain is almost certainly NOT the memory.")
+        if has_inj:
+            inj = sum(1 for t in v2_only if audit.get(t, {}).get("n_injected", 0) > 0)
+            print(f"\nDEFINITIVE (injection log): {inj}/{c} of the fixed tasks had memory injected during the run.")
+            kinds = Counter(k for t in v2_only for k in audit.get(t, {}).get("injected_kinds", []))
+            if kinds:
+                print(f"  injected kinds on fixed tasks: {dict(kinds)}")
+            print("  NOTE: injection is real (the memo was surfaced); 'injected' still != 'caused', but this")
+            print("        is far stronger than availability. 0 here => the gain is NOT the memory.")
+        else:
+            rel = sum(1 for t in v2_only if audit.get(t, {}).get("relevant_card_available"))
+            print(f"\nMemory-availability PROXY on the {c} fixed tasks: {rel}/{c} had a relevant card available.")
+            print("  (old audit without the 'injected' field -> upper bound, not confirmed injection.)")
+            if rel == 0:
+                print("  -> 0 relevant cards on the fixed tasks => the +gain is almost certainly NOT the memory.")
     elif not args.audit:
-        print("\n(Pass --audit ledger.audit.jsonl to cross-reference the fixed tasks against the memory.)")
+        print("\n(Pass --audit ledger.audit.jsonl / ledger.v3.audit.jsonl to cross-reference fixed tasks.)")
 
 
 if __name__ == "__main__":
