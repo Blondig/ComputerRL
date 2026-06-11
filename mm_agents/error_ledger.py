@@ -75,13 +75,6 @@ def _tokenize(text: str, max_tokens: int = 80) -> List[str]:
     return [tok for tok, _count in counts.most_common(max_tokens)]
 
 
-def _overlap_score(query_tokens: List[str], memory_tokens: List[str]) -> float:
-    if not query_tokens or not memory_tokens:
-        return 0.0
-    q, m = set(query_tokens), set(memory_tokens)
-    return len(q & m) / max(1, min(len(q), len(m)))
-
-
 def _active_title(obs: Optional[dict]) -> str:
     if not obs:
         return ""
@@ -521,15 +514,16 @@ class ErrorLedgerV3:
     """Lightweight cross-task trajectory memory from passive rollouts.
 
     v3 deliberately avoids active exploration, embeddings, model training, and
-    MCTS. It keeps the v1/v2 public retrieval interface, but records richer
-    transition context when the runner provides it:
+    MCTS. It records pre_state -> action_signature -> post_state transitions, and
+    retrieves by EXACT action-signature trigger (no state-token similarity, no
+    score thresholds): memory surfaces only when the agent just invoked an action
+    that is in the bank, so there is nothing to hand-tune and no cross-task flooding.
 
-        pre_state -> action_signature -> post_state
-
-    The memory bank is intentionally small and conservative:
-      * error_notes: risky actions in similar states
-      * success_snippets: short successful action-signature patterns
-      * action_stats: next-state dispersion for ambiguity warnings
+    Two banks:
+      * error_notes: "this exact call has failed here before" (carries the real error)
+      * success_snippets: "after this call, a past success did X" (next-step proposal)
+    (An earlier ambiguity/action_stats bank was removed: same-state dispersion never
+    recurs under an exact state_sig, so it was dead weight.)
     """
 
     inject_target = "user"
@@ -615,7 +609,6 @@ class ErrorLedgerV3:
 
         self._append_audit(task_id, success, self._steps, self._injected)
         for step in self._steps:
-            self._upsert_action_stats(step)
             if step.get("is_error"):
                 self._upsert_error_note(step, task_id, success)
         if success:
@@ -634,15 +627,17 @@ class ErrorLedgerV3:
         app = normalize_app(app)
         if not app:
             return ""
-        current = summarize_observation(obs)
-        query_tokens = current.get("tokens", [])
-        if not query_tokens:
+        # Exact action-trigger retrieval: memory surfaces ONLY when the agent just
+        # invoked an action that is in the bank. No state-token similarity, no score
+        # thresholds -- nothing to hand-tune, and the chrome-dominated cross-task
+        # matching that caused the flooding is gone.
+        recent_text = " ".join(a for a in (recent_actions or []) if a)
+        if not recent_text:
             return ""
 
         notes = []
-        notes.extend(self._retrieve_error_notes(app, current, recent_actions or []))
-        notes.extend(self._retrieve_success_snippets(app, current, instruction))
-        notes.extend(self._retrieve_ambiguity_notes(app, current, recent_actions or []))
+        notes.extend(self._retrieve_error_notes(app, recent_text))
+        notes.extend(self._retrieve_success_snippets(app, recent_text))
         if not notes:
             return ""
 
@@ -745,110 +740,63 @@ class ErrorLedgerV3:
                     ))
                     snippet["state_tokens"] = merged_tokens[:80]
 
-    def _upsert_action_stats(self, step: dict):
-        pre = step.get("pre", {})
-        post = step.get("post", {})
-        action_sig = step.get("action_sig", "unknown")
-        if action_sig in {"unknown", "WAIT"}:
-            return
-        key = "ACT|{app}|{state}|{action}".format(
-            app=step.get("app", "unknown"),
-            state=pre.get("state_sig", "unknown"),
-            action=action_sig,
-        )
-        stats = self.memory.setdefault("action_stats", {})
-        stat = stats.setdefault(key, {
-            "id": key,
-            "app": step.get("app", "unknown"),
-            "state_sig": pre.get("state_sig", "unknown"),
-            "state_tokens": pre.get("tokens", [])[:80],
-            "action_sig": action_sig,
-            "next_states": {},
-            "support_count": 0,
-        })
-        next_sig = post.get("state_sig", "unknown")
-        stat["next_states"][next_sig] = stat["next_states"].get(next_sig, 0) + 1
-        stat["support_count"] += 1
-
     # ----- retrieval ---------------------------------------------------
 
-    def _retrieve_error_notes(self, app: str, current: dict, recent_actions: List[str]) -> List[dict]:
-        results = []
-        recent_text = " ".join(recent_actions or [])
+    def _retrieve_error_notes(self, app: str, recent_text: str) -> List[dict]:
+        # Aggregate failures by action_sig (the bank keys per state_sig; here we only
+        # care that the agent JUST invoked an action that has failed before in this app).
+        # Exact substring match on the high-level call -> no similarity, no threshold.
+        by_action: Dict[str, dict] = {}
         for note in self.memory.get("error_notes", {}).values():
             if note.get("app") != app:
                 continue
-            score = self._state_score(current, note)
-            if note.get("action_sig") and note.get("action_sig") in recent_text:
-                score += 0.25
-            if score < 0.38:
+            sig = note.get("action_sig") or ""
+            if not sig or sig == "unknown" or sig not in recent_text:
                 continue
+            cur = by_action.get(sig)
+            if cur is None or note.get("support_count", 0) > cur.get("support_count", 0):
+                by_action[sig] = note
+        results = []
+        for sig, note in by_action.items():
             results.append({
-                "id": note["id"],
+                "id": "RISK|{}|{}".format(app, sig),
                 "kind": "risk",
-                "score": score + min(note.get("support_count", 1), 3) * 0.03,
-                "text": (
-                    "Risk in similar state: action {action} previously failed. "
-                    "Check target/selection first; result was: {result}"
-                ).format(
-                    action=note.get("action_sig", "unknown"),
-                    result=(note.get("example_result") or "unknown")[:180],
-                ),
+                # score is for ORDERING only (never compared to a cutoff): prefer risks,
+                # then higher support.
+                "score": 1.0 + min(note.get("support_count", 1), 3) * 0.1,
+                "text": ("Risk: {action} has failed before here (e.g. \"{result}\"). "
+                         "Verify it actually took effect before continuing.").format(
+                    action=sig, result=(note.get("example_result") or "unknown")[:160]),
             })
         return results
 
-    def _retrieve_success_snippets(self, app: str, current: dict, instruction: str) -> List[dict]:
+    def _retrieve_success_snippets(self, app: str, recent_text: str) -> List[dict]:
+        # Prefix trigger: if the agent JUST invoked the first action of a known-successful
+        # short pattern, propose what came next. Exact match on the first action.
         results = []
-        instruction_tokens = _tokenize(instruction or "", max_tokens=40)
-        for snippet in self.memory.get("success_snippets", {}).values():
-            if snippet.get("app") != app:
+        seen = set()
+        for snip in self.memory.get("success_snippets", {}).values():
+            if snip.get("app") != app:
                 continue
-            state_score = self._state_score(current, snippet)
-            task_score = _overlap_score(instruction_tokens, snippet.get("task_tokens", []))
-            score = state_score + 0.3 * task_score + min(snippet.get("support_count", 1), 3) * 0.03
-            if score < 0.42:
+            actions = snip.get("action_sigs") or []
+            if len(actions) < 2:
                 continue
+            first = actions[0]
+            if not first or first == "unknown" or first not in recent_text:
+                continue
+            key = ">".join(actions)
+            if key in seen:
+                continue
+            seen.add(key)
             results.append({
-                "id": snippet["id"],
+                "id": "NEXT|{}|{}".format(app, key),
                 "kind": "success",
-                "score": score,
-                "text": (
-                    "Similar successful short pattern: {actions}. "
-                    "Use it only as a proposal and adapt all arguments to the current task."
-                ).format(actions=" -> ".join(snippet.get("action_sigs", []))),
+                "score": 0.9 + min(snip.get("support_count", 1), 3) * 0.1,
+                "text": ("After {first}, a past successful run did: {rest}. "
+                         "Consider it as a next step (adapt arguments to the current task).").format(
+                    first=first, rest=" -> ".join(actions[1:])),
             })
         return results
-
-    def _retrieve_ambiguity_notes(self, app: str, current: dict, recent_actions: List[str]) -> List[dict]:
-        results = []
-        recent_text = " ".join(recent_actions or [])
-        for stat in self.memory.get("action_stats", {}).values():
-            if stat.get("app") != app:
-                continue
-            next_states = stat.get("next_states", {})
-            if len(next_states) < 2 or stat.get("support_count", 0) < 3:
-                continue
-            score = self._state_score(current, stat)
-            if stat.get("action_sig") in recent_text:
-                score += 0.15
-            if score < 0.45:
-                continue
-            results.append({
-                "id": stat["id"],
-                "kind": "ambiguity",
-                "score": score,
-                "text": (
-                    "Ambiguity warning: in similar states, action {action} led to "
-                    "{n} different next states. Verify the current target/state before "
-                    "continuing or calling DONE."
-                ).format(action=stat.get("action_sig", "unknown"), n=len(next_states)),
-            })
-        return results
-
-    def _state_score(self, current: dict, item: dict) -> float:
-        if current.get("state_sig") == item.get("state_sig"):
-            return 1.0
-        return _overlap_score(current.get("tokens", []), item.get("state_tokens", []))
 
     def _format(self, items: List[dict]) -> str:
         lines = [
