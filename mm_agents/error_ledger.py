@@ -36,6 +36,47 @@ def _is_error(exe_result: str) -> bool:
     return any(m in exe_result for m in _ERROR_MARKERS)
 
 
+# --- GUI-agent-generic ledger admission classifier --------------------------
+# Grounding boundary:  model output -> parser -> EXECUTABLE COMMAND -> env/tool.
+# Cross-task memory may learn ONLY from failures AFTER a valid command crosses
+# this boundary (the world actually ran it and pushed back). Failures BEFORE the
+# boundary (the command never became valid code / never ran) carry no
+# transferable world-knowledge -- they are this agent's own output-formatting /
+# serialization noise, and writing them in produces false causality
+# ("Tool.X failed" when really the agent emitted a malformed fenced block).
+#
+# Detection is STRUCTURAL -- "did the command compile and run" -- never by app
+# or tool name. That is what keeps it from overfitting to OSWorld/LibreOffice:
+# a Calc tool call, a browser action, or a JSON action schema all share this one
+# boundary. A compile-time error means the dispatched code was not valid code,
+# so nothing was ever tested against the world (this is the generic form of the
+# python\n / content-block-repr / nXxxTools mangling -- they all land here).
+_COMPILE_ERROR_MARKERS = ("SyntaxError", "IndentationError", "TabError")
+
+
+def classify_error_step(exe_result: str, action_sig: str = "") -> str:
+    """Bucket an errored step by WHERE in the action pipeline it failed.
+
+    Returns:
+        "representation" -- command never compiled/ran (pre-boundary)  -> DROP
+        "no_action"      -- parser produced no executable action       -> DROP
+        "execution"      -- command ran, env/tool returned a failure   -> ADMIT
+    """
+    text = exe_result or ""
+    if any(m in text for m in _COMPILE_ERROR_MARKERS):
+        return "representation"
+    if not action_sig or action_sig == "unknown":
+        return "no_action"
+    return "execution"
+
+
+def is_admissible_error(exe_result: str, action_sig: str = "") -> bool:
+    """True iff the error reflects real post-boundary world feedback, i.e. the
+    only kind worth carrying across tasks. Currently UNUSED by the ledger
+    (behavior-neutral); validate the split on existing audits before gating."""
+    return classify_error_step(exe_result, action_sig) == "execution"
+
+
 def _extract_api_call(action) -> str:
     if isinstance(action, dict):
         return action.get("action_type", "unknown")
