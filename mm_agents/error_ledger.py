@@ -72,8 +72,15 @@ def classify_error_step(exe_result: str, action_sig: str = "") -> str:
 
 def is_admissible_error(exe_result: str, action_sig: str = "") -> bool:
     """True iff the error reflects real post-boundary world feedback, i.e. the
-    only kind worth carrying across tasks. Currently UNUSED by the ledger
-    (behavior-neutral); validate the split on existing audits before gating."""
+    only kind worth carrying across tasks. Used by ErrorLedgerV3.finalize_task to
+    gate which errored steps become persistent cross-task error_notes.
+
+    SCOPE CAVEAT: this treats a compile-time error (SyntaxError/...) as a
+    pre-boundary mangling failure, which holds when the dispatched command is the
+    AGENT's own code wrapping a GUI action (the office domains). If a tool itself
+    *runs user code* (e.g. CodeTools.run_python), its SyntaxError IS post-boundary
+    feedback and this rule would wrongly drop it. Before extending to such a
+    domain, re-check the audit class distribution rather than assuming this rule."""
     return classify_error_step(exe_result, action_sig) == "execution"
 
 
@@ -649,16 +656,27 @@ class ErrorLedgerV3:
             return
 
         self._append_audit(task_id, success, self._steps, self._injected)
+        # Admission control: an errored step is written to cross-task memory ONLY
+        # if it is a post-grounding-boundary failure (the command actually ran and
+        # the tool/env pushed back). Pre-boundary failures -- the command never
+        # compiled into a valid action (parser/serialization mangling) -- stay in
+        # the audit above for visibility but never become a cross-task "tool risk".
+        admitted = dropped = 0
         for step in self._steps:
-            if step.get("is_error"):
+            if not step.get("is_error"):
+                continue
+            if is_admissible_error(step.get("exe_result", ""), step.get("action_sig", "")):
                 self._upsert_error_note(step, task_id, success)
+                admitted += 1
+            else:
+                dropped += 1
         if success:
             self._upsert_success_snippets(task_id)
 
         self._save_memory()
         logger.info(
-            "ErrorLedgerV3: finalized %s success=%s steps=%d memory=%d injected=%d",
-            task_id, success, len(self._steps), self.count(), len(self._injected)
+            "ErrorLedgerV3: finalized %s success=%s steps=%d err_admit=%d err_drop=%d memory=%d injected=%d",
+            task_id, success, len(self._steps), admitted, dropped, self.count(), len(self._injected)
         )
         self.reset_task()
 
