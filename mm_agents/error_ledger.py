@@ -84,6 +84,21 @@ def is_admissible_error(exe_result: str, action_sig: str = "") -> bool:
     return classify_error_step(exe_result, action_sig) == "execution"
 
 
+# Adapter / instrumentation actions: calls the grounding layer appends to EVERY
+# command (grounding_agent.tool_commands suffixes `{Tool}.print_result()`), so the
+# agent never *chooses* them and they sit in recent_text on every task. Keying
+# cross-task memory on such an action yields a semantically-empty note that fires
+# on ~all tasks (it was 88% of v33's injections). Exclude it from both learning
+# and retrieval. This is the framework's universal observe hook -- a per-agent
+# fact, NOT a per-app/per-tool allowlist, so it does not reintroduce overfitting.
+_ADAPTER_METHODS = ("print_result",)
+
+
+def _is_adapter_action(sig: str) -> bool:
+    sig = sig or ""
+    return any(sig == m or sig.endswith("." + m) for m in _ADAPTER_METHODS)
+
+
 def _extract_api_call(action) -> str:
     if isinstance(action, dict):
         return action.get("action_type", "unknown")
@@ -661,22 +676,23 @@ class ErrorLedgerV3:
         # the tool/env pushed back). Pre-boundary failures -- the command never
         # compiled into a valid action (parser/serialization mangling) -- stay in
         # the audit above for visibility but never become a cross-task "tool risk".
-        admitted = dropped = 0
+        admitted = adapter = dropped = 0
         for step in self._steps:
             if not step.get("is_error"):
                 continue
-            if is_admissible_error(step.get("exe_result", ""), step.get("action_sig", "")):
-                self._upsert_error_note(step, task_id, success)
-                admitted += 1
+            if not is_admissible_error(step.get("exe_result", ""), step.get("action_sig", "")):
+                dropped += 1                       # pre-grounding-boundary -> audit only
+            elif self._upsert_error_note(step, task_id, success):
+                admitted += 1                      # post-boundary, real action -> learned
             else:
-                dropped += 1
+                adapter += 1                       # post-boundary but adapter -> not learned
         if success:
             self._upsert_success_snippets(task_id)
 
         self._save_memory()
         logger.info(
-            "ErrorLedgerV3: finalized %s success=%s steps=%d err_admit=%d err_drop=%d memory=%d injected=%d",
-            task_id, success, len(self._steps), admitted, dropped, self.count(), len(self._injected)
+            "ErrorLedgerV3: finalized %s success=%s steps=%d err_admit=%d err_adapter=%d err_drop=%d memory=%d injected=%d",
+            task_id, success, len(self._steps), admitted, adapter, dropped, self.count(), len(self._injected)
         )
         self.reset_task()
 
@@ -718,9 +734,14 @@ class ErrorLedgerV3:
 
     # ----- memory builders --------------------------------------------
 
-    def _upsert_error_note(self, step: dict, task_id: str, success: bool):
+    def _upsert_error_note(self, step: dict, task_id: str, success: bool) -> bool:
+        """Write/refresh a cross-task error note. Returns True iff a note was
+        actually persisted (False = skipped as an adapter/observe action), so the
+        caller's err_admit count reflects real notes, not adapter-filtered ones."""
         pre = step.get("pre", {})
         action_sig = step.get("action_sig", "unknown")
+        if _is_adapter_action(action_sig):
+            return False  # never key memory on the auto-appended observe hook
         key = "ERR|{app}|{state}|{action}".format(
             app=step.get("app", "unknown"),
             state=pre.get("state_sig", "unknown"),
@@ -744,6 +765,7 @@ class ErrorLedgerV3:
         note["example_result"] = step.get("exe_result", "")[:240]
         note["last_task_success"] = bool(success)
         note["last_seen_task"] = task_id
+        return True
 
     def _upsert_success_snippets(self, task_id: str):
         # Split the trajectory into runs of consecutive real actions, then window
@@ -761,8 +783,8 @@ class ErrorLedgerV3:
                 if run:
                     runs.append(run)
                     run = []
-            elif sig in _WAIT_SIGS:
-                continue            # drop the pause, keep the run going
+            elif sig in _WAIT_SIGS or _is_adapter_action(sig):
+                continue            # drop non-semantic pause / auto-appended observe hook, keep the run going
             else:
                 run.append(s)
         if run:
@@ -810,7 +832,7 @@ class ErrorLedgerV3:
             if note.get("app") != app:
                 continue
             sig = note.get("action_sig") or ""
-            if not sig or sig == "unknown" or sig not in recent_text:
+            if not sig or sig == "unknown" or _is_adapter_action(sig) or sig not in recent_text:
                 continue
             cur = by_action.get(sig)
             if cur is None or note.get("support_count", 0) > cur.get("support_count", 0):
@@ -841,7 +863,7 @@ class ErrorLedgerV3:
             if len(actions) < 2:
                 continue
             first = actions[0]
-            if not first or first == "unknown" or first not in recent_text:
+            if not first or first == "unknown" or _is_adapter_action(first) or first not in recent_text:
                 continue
             key = ">".join(actions)
             if key in seen:
