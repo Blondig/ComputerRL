@@ -592,7 +592,8 @@ class ErrorLedgerV3:
     inject_target = "user"
 
     def __init__(self, ledger_path: str, max_inject: int = 2,
-                 max_consults_per_task: int = 1, ttl_steps: int = 4):
+                 max_consults_per_task: int = 1, ttl_steps: int = 4,
+                 use_success_snippets: bool = True):
         self.ledger_path = ledger_path
         base, _ext = os.path.splitext(ledger_path)
         self.memory_path = base + ".v3.json"
@@ -600,6 +601,10 @@ class ErrorLedgerV3:
         self.max_inject = max_inject
         self.max_consults_per_task = max_consults_per_task
         self.ttl_steps = ttl_steps
+        # Ablation toggle (v35 risk-only): when False, success snippets are still
+        # RECORDED (the learned bank is identical) but never RETRIEVED/injected, so
+        # the isolated variable is "does surfacing NEXT contribute", not the data.
+        self.use_success_snippets = use_success_snippets
 
         self.memory: Dict[str, Any] = self._load_memory()
         self._steps: List[dict] = []
@@ -712,7 +717,8 @@ class ErrorLedgerV3:
 
         notes = []
         notes.extend(self._retrieve_error_notes(app, recent_text))
-        notes.extend(self._retrieve_success_snippets(app, recent_text))
+        if self.use_success_snippets:
+            notes.extend(self._retrieve_success_snippets(app, recent_text))
         if not notes:
             return ""
 
@@ -938,7 +944,8 @@ class ErrorLedgerV3:
 # ======================================================================
 
 def make_error_ledger(path: str, version: str = "v1", max_inject: int = 1,
-                      max_consults_per_task: int = 1, ttl_steps: int = 4):
+                      max_consults_per_task: int = 1, ttl_steps: int = 4,
+                      use_success_snippets: bool = True):
     """v1 keeps its original defaults (max_inject=5, system injection)."""
     if version == "v2":
         return ErrorLedgerV2(path, max_inject=max_inject,
@@ -947,5 +954,6 @@ def make_error_ledger(path: str, version: str = "v1", max_inject: int = 1,
     if version == "v3":
         return ErrorLedgerV3(path, max_inject=max_inject,
                              max_consults_per_task=max_consults_per_task,
-                             ttl_steps=ttl_steps)
+                             ttl_steps=ttl_steps,
+                             use_success_snippets=use_success_snippets)
     return ErrorLedger(path)

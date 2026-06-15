@@ -131,7 +131,10 @@ def config() -> argparse.Namespace:
                         help="v2/v3 only: max times a given memory may be (re)selected within one task.")
     parser.add_argument("--ledger_ttl", type=int, default=4,
                         help="v2 only: steps an injected card stays active before it can be dropped.")
-    
+    parser.add_argument("--ledger_disable_success_snippets", action="store_true",
+                        help="v3 only (v35 risk-only ablation): still RECORD success snippets but "
+                             "never retrieve/inject NEXT notes, isolating whether surfacing NEXT contributes.")
+
     args = parser.parse_args()
 
     return args
@@ -448,10 +451,12 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         max_inject=args.ledger_max_inject,
         max_consults_per_task=args.ledger_max_consults,
         ttl_steps=args.ledger_ttl,
+        use_success_snippets=not args.ledger_disable_success_snippets,
     ) if args.error_ledger else None
     if ledger:
         logger.info(f"ErrorLedger[{args.ledger_version}] enabled: {args.error_ledger} "
-                    f"({ledger.count()} existing entries/cards)")
+                    f"({ledger.count()} existing entries/cards)"
+                    + ("  [risk-only: NEXT retrieval OFF]" if args.ledger_disable_success_snippets else ""))
 
     agent = AutoGLMAgent(
         action_space=args.action_space,
