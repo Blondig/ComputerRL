@@ -83,10 +83,11 @@ def action_role(sig: str) -> str:
 _DROP_ROLES = {"adapter", "terminal", "garbled", "other"}
 _LOWLEVEL = {"lowlevel_select", "lowlevel_input"}
 
+# motif keys are " > "-joined strings (the ngram format), so these must match exactly
 MOTIFS_OF_INTEREST = [
-    ("inspect", "mutate_data"), ("inspect", "structural_edit"),
-    ("locate", "format"), ("locate", "input"),
-    ("format", "commit"), ("mutate_data", "commit"), ("structural_edit", "commit"),
+    "inspect > mutate_data", "inspect > structural_edit",
+    "locate > format", "locate > input",
+    "format > commit", "mutate_data > commit", "structural_edit > commit",
 ]
 
 
@@ -201,7 +202,7 @@ def main():
         for g, m in dom[d]["motif"].items():
             if len(m["tasks"]) >= args.min:
                 discovered.add(g)
-    motif_list = [tuple(x) for x in MOTIFS_OF_INTEREST] + sorted(discovered - set(map(tuple, MOTIFS_OF_INTEREST)))
+    motif_list = MOTIFS_OF_INTEREST + sorted(discovered - set(MOTIFS_OF_INTEREST))
 
     print("\n" + "=" * 96)
     print("ROLE-MOTIF CROSS-DOMAIN LIFT  (lift pp [n, fx/bk] per domain | verdict)")
@@ -223,7 +224,7 @@ def main():
         present = [x for x in lifts if x is not None]
         pos = sum(1 for x in present if x >= 10)
         clearly_neg = any(x <= -10 for x in present)
-        is_ll = any(role in _LOWLEVEL for role in g)
+        is_ll = any(role in _LOWLEVEL for role in g.split(" > "))
         if is_ll:
             verdict = "  (lowlevel -- diagnostic only, NOT procedural)"   # never positive knowledge
         elif pos >= 2 and not clearly_neg:
@@ -232,8 +233,8 @@ def main():
             verdict = "  (single-domain)"
         else:
             verdict = ""
-        star = "*" if tuple(g) in set(map(tuple, MOTIFS_OF_INTEREST)) else " "
-        print(f" {star}{(' > '.join(g)):28s}" + "".join(cells) + verdict)
+        star = "*" if g in set(MOTIFS_OF_INTEREST) else " "
+        print(f" {star}{g:28s}" + "".join(cells) + verdict)
 
     print("\nSTUCK signals (diagnostic; err-loop under-counts since collapse steps may be unrecorded):")
     for d in domains:
