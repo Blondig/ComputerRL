@@ -41,6 +41,8 @@ _TERMINAL_VERBS = ("save", "exit", "wait", "done", "fail", "finish", "close", "p
 
 # ----------------------------------------------------------------------
 def _sig(step):
+    if not step:
+        return ""
     return step.get("action_sig") or step.get("api_call") or ""
 
 
