@@ -72,6 +72,26 @@ def find_audit(root):
     return None
 
 
+def load_bank(root):
+    """{memory_id: card} from the persisted ledger.v3.json (error_notes +
+    success_snippets), so [D] can show what a card actually SAYS, not just its id.
+    v31's injected ids are the bank keys, so the join is direct."""
+    if not root:
+        return {}
+    hits = glob.glob(os.path.join(root, "**", "*.v3.json"), recursive=True)
+    if not hits:
+        return {}
+    try:
+        d = json.load(open(sorted(hits)[0]))
+    except Exception:
+        return {}
+    out = {}
+    for sect in ("error_notes", "success_snippets"):
+        for k, v in (d.get(sect) or {}).items():
+            out[k] = v
+    return out
+
+
 def load_audit(path):
     """{task_id: record} where record has steps, injected, success, app, step_by_idx."""
     out = {}
@@ -161,6 +181,7 @@ def main():
     base_scores = collect_scores(args.baseline)
     tgt_scores = collect_scores(args.target)
     tgt_audit = load_audit(find_audit(args.target))
+    bank = load_bank(args.target)
     if not tgt_scores and not tgt_audit:
         print("Nothing found under --target (no result.txt / audit).")
         return
@@ -296,7 +317,11 @@ def main():
         prev = ",".join(f"{k}:{v}" for k, v in c["prev"].most_common())
         nxt = c["next"].most_common(1)[0][0] if c["next"] else "-"
         print(f"  inj={c['n']:<3d} fx/bk={c['fixed']}/{c['broke']} succ={sr:4.0f}%  prev[{prev}]  next={nxt}")
-        print(f"        {mid}")
+        card = bank.get(mid, {})
+        text = (card.get("example_result") or "").replace("\n", " ")[:80] if card else ""
+        sup = card.get("support_count")
+        extra = (f"  «{text}»" if text else "") + (f"  sup={sup}" if sup is not None else "")
+        print(f"        {mid}{extra}")
 
     if args.csv:
         cols = ["task_id", "app", "baseline_score", "target_score", "label", "n_steps", "n_err",
