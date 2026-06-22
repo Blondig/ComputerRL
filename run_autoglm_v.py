@@ -131,6 +131,10 @@ def config() -> argparse.Namespace:
                         help="v2/v3 only: max times a given memory may be (re)selected within one task.")
     parser.add_argument("--ledger_ttl", type=int, default=4,
                         help="v2 only: steps an injected card stays active before it can be dropped.")
+    parser.add_argument("--recovery", action="store_true",
+                        help="Enable intra-task action-interface recovery (L1/L2 hints on "
+                             "dispatch failures / persistent same-template loops). Independent "
+                             "of Omni and the cross-task ledger.")
     parser.add_argument("--ledger_disable_success_snippets", action="store_true",
                         help="v3 only (v35 risk-only ablation): still RECORD success snippets but "
                              "never retrieve/inject NEXT notes, isolating whether surfacing NEXT contributes.")
@@ -469,6 +473,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         omni_data_dir=args.omni_data_dir,
         omni_llm_model=args.omni_llm_model,
         error_ledger=ledger,
+        use_recovery=args.recovery,
     )
 
     for domain in tqdm(test_all_meta, desc="Domain"):

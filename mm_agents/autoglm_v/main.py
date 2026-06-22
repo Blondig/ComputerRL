@@ -9,10 +9,21 @@ from .prompt.accessibility_tree_handle import linearize_accessibility_tree, trim
 from .prompt.grounding_agent import GroundingAgent as Agent
 from .tools.package.google_chrome import BrowserTools
 from .prompt.procedural_memory import Prompt
+from .intra_recovery import RecoveryMonitor
 
 logger = logging.getLogger("desktopenv.agent")
 
 pure_text_settings = ["a11y_tree"]
+
+def _recovery_fingerprint(stage: str, exc) -> str:
+    """Discriminative, normalized recovery fingerprint: stage + exception class +
+    message (quotes/numbers masked). Ensures three DIFFERENT interface failures are
+    NOT collapsed into one L2 same-template count."""
+    msg = getattr(exc, "msg", None) or str(exc)
+    msg = re.sub(r"'[^']*'", "'X'", msg)
+    msg = re.sub(r'"[^"]*"', '"X"', msg)
+    msg = re.sub(r"\b\d+\b", "N", msg)
+    return "{}:{}: {}".format(stage, type(exc).__name__, re.sub(r"\s+", " ", msg).strip())[:120]
 
 def resize_image(image, w, h):
     img = Image.open(BytesIO(image))
@@ -78,6 +89,7 @@ class AutoGLMAgent:
         omni_llm_model="autoglm-os",
         omni_top_k: int = 5,
         error_ledger=None,
+        use_recovery: bool = False,
     ):
         self.action_space = action_space
         self.observation_type = observation_type
@@ -111,14 +123,19 @@ class AutoGLMAgent:
         }
         
         Agent.relative_coordinate = relative_coordinate
-        
+
+        # Intra-task action-interface recovery (independent of Omni / ledger / parser).
+        self.use_recovery = use_recovery
+        self.recovery = RecoveryMonitor() if use_recovery else None
+        self._recovery_level = None     # hint pending for the NEXT prepare()
+
         self.contents = []
 
     @property
     def turn_number(self):
         return len(self.contents)
 
-    def prepare(self, instruction: str, obs: Dict, history: List, last_result: str = "") -> List:
+    def prepare(self, instruction: str, obs: Dict, history: List, last_result: str = "", recovery_hint: str = "") -> List:
         """
         Predict the next action(s) based on the current observation.
         """
@@ -202,6 +219,10 @@ class AutoGLMAgent:
         if mem_context and mem_target == "user":
             prompt += "\n\n" + mem_context
 
+        # intra-task recovery hint (L1/L2) -- independent of any cross-task memory
+        if recovery_hint:
+            prompt += "\n\n" + recovery_hint
+
         content = [{"type": "text", "text": prompt}]
         if self.with_image and obs.get('screenshot'):
             screenshot = resize_image(obs['screenshot'], self.image_size[0], self.image_size[1])
@@ -220,6 +241,11 @@ class AutoGLMAgent:
         return messages
 
     def execute(self, response, obs):
+        # ComputerRL adapter for the recovery monitor: did the action cross the
+        # parser/dispatch interface? parser empty -> no; grounded command fails to
+        # compile -> no; otherwise yes. (Tool runtime errors are NOT interface
+        # failures -- they crossed the interface and got real feedback.)
+        interface_ok, parse_exc = True, None
         try:
             actions = parse_code_from_string(response)
             action = actions[0]
@@ -239,8 +265,37 @@ class AutoGLMAgent:
         except Exception as e:
             print("Failed to parse action from response", e)
             actions = []
+            interface_ok, parse_exc = False, e
+
+        # Recovery monitoring runs ONLY when enabled -- the baseline (--recovery off)
+        # path does zero extra work (no fingerprint, no compile() interface check).
+        if self.recovery is not None:
+            if parse_exc is not None:
+                # discriminative fingerprint (stage+class+msg), NOT a flat "parse_failure",
+                # so three different parse/eval errors are not one L2 template.
+                fingerprint = _recovery_fingerprint("parse", parse_exc)
+            elif actions and isinstance(actions[0], str):
+                # any STRING command must compile to have crossed the interface; a dict/
+                # object action (eval'd Agent.*/BrowserTools.*) is already a valid action.
+                interface_ok, fingerprint = self._interface_check(actions[0])
+            else:
+                fingerprint = ""
+            self._recovery_level = self.recovery.step(interface_ok, fingerprint)
+            logger.info("IntraRecovery: %s", self.recovery.last_step)   # every step -> self-recovery rate
 
         return actions
+
+    @staticmethod
+    def _interface_check(command):
+        """compile() the grounded command without running it. ANY compile rejection
+        (SyntaxError / IndentationError / TabError / ValueError ...) means the dispatched
+        command is not valid code => the action never crossed the execution interface
+        (our serialization broke), NOT tool feedback."""
+        try:
+            compile(command, "<recovery-interface-check>", "exec")
+            return True, ""
+        except Exception as e:
+            return False, _recovery_fingerprint("compile", e)
 
     def format_history(self, current_exe_result="", max_turns=30):
         history = []
@@ -314,9 +369,14 @@ class AutoGLMAgent:
         return result_indices
 
     def predict(self, instruction: str, obs: Dict) -> List:
+        # Recovery hint pending from the previous step's interface check (if any),
+        # injected into this turn's user message. (Recovery does NOT touch Omni history;
+        # the force-recent-under-Omni option was reverted and is deferred to a separate
+        # change for the Omni+Recovery condition.)
+        recovery_hint = RecoveryMonitor.hint_text(self._recovery_level) if self._recovery_level else ""
         # history = self.format_history()
         history = self.format_history(obs.get("exe_result", ""))
-        messages = self.prepare(instruction, obs, history)
+        messages = self.prepare(instruction, obs, history, recovery_hint=recovery_hint)
 
         assert self.gen_func is not None, "gen_func is not set"
         for _ in range(3):
@@ -359,6 +419,9 @@ class AutoGLMAgent:
         logger = _logger if _logger is not None else logging.getLogger("desktopenv.aguvis_agent")
 
         self.contents = []
+        self._recovery_level = None
+        if self.recovery is not None:
+            self.recovery.reset()
         self._init_omni()
 
     def _init_omni(self):
