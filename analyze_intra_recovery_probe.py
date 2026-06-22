@@ -12,6 +12,9 @@ application-specific failure fingerprints:
     accessibility hashes unchanged (a conservative proxy for repeated screens).
   * accumulated_failure: at least N errored actions in the latest W steps.
   * repeated_failure: the same normalized failure occurs at least N times in W.
+  * confirmed_failure_loop: the same normalized failure reaches N occurrences
+    inside W while the trajectory remains in one uninterrupted error streak.
+    It fires once per streak, after evidence of failed self-recovery.
 
 Low-level action runs are reported only as diagnostics. A click/type sequence is
 normal in many GUI domains and is therefore never promoted to a recovery trigger
@@ -48,6 +51,7 @@ _TERMINAL_SIGS = {"WAIT", "DONE", "FAIL", "Agent.wait", "Agent.exit", ""}
 
 _PRIMARY_SIGNALS = (
     "action_interface_failure",
+    "confirmed_failure_loop",
     "repeated_action",
     "repeated_state",
     "accumulated_failure",
@@ -163,6 +167,23 @@ def _compile_origin(step):
     return "execution_syntax"
 
 
+def _is_interface_origin(origin):
+    return origin in {"parse_validation", "dispatch_wrapper"}
+
+
+def _crossed_interface(origin):
+    """Whether the recorded action is known to have reached execution."""
+    return origin is None or origin == "execution_syntax"
+
+
+def _is_terminal_step(step):
+    sig = _action_sig(step)
+    action = str(step.get("action_text") or "").strip()
+    return bool(sig and sig in _TERMINAL_SIGS) or bool(
+        action and action in _TERMINAL_SIGS
+    )
+
+
 def _max_true_run(flags):
     best = run = 0
     for flag in flags:
@@ -205,6 +226,93 @@ def _rolling_repeated(values, window, threshold):
     return False
 
 
+def _interface_failure_events(steps, errors, origins):
+    """Describe local self-recovery after each pre-execution failure."""
+    events = []
+    for index, origin in enumerate(origins):
+        if not _is_interface_origin(origin):
+            continue
+
+        next_step = index + 1
+        has_next = next_step < len(steps)
+        next_dispatch = (
+            has_next
+            and not _is_terminal_step(steps[next_step])
+            and _crossed_interface(origins[next_step])
+        )
+        clean_within_two = any(
+            not _is_terminal_step(steps[candidate])
+            and _crossed_interface(origins[candidate])
+            and not errors[candidate]
+            for candidate in range(index + 1, min(len(steps), index + 3))
+        )
+        events.append({
+            "step_index": index,
+            "origin": origin,
+            "has_next": has_next,
+            "next_dispatch": next_dispatch,
+            "clean_within_two": clean_within_two,
+        })
+    return events
+
+
+def _confirmed_failure_loop_events(errors, templates, origins, window, threshold):
+    """Fire once when a repeated error is confirmed in a continuous streak.
+
+    A non-error step resets the streak and permits a future trigger. This is
+    deliberately stricter than repeated_failure: successful execution between
+    errors is treated as evidence that the agent may still be making progress.
+    """
+    events = []
+    streak_start = 0
+    fired_in_streak = False
+
+    for end, is_error in enumerate(errors):
+        if not is_error:
+            streak_start = end + 1
+            fired_in_streak = False
+            continue
+        if fired_in_streak:
+            continue
+
+        start = max(streak_start, end - window + 1)
+        counts = Counter(template for template in templates[start:end + 1] if template)
+        repeated = [
+            (template, count)
+            for template, count in counts.items()
+            if count >= threshold
+        ]
+        if not repeated:
+            continue
+
+        template, count = max(repeated, key=lambda item: (item[1], item[0]))
+        matching = [
+            index
+            for index in range(start, end + 1)
+            if templates[index] == template
+        ]
+        interface_count = sum(
+            _is_interface_origin(origins[index]) for index in matching
+        )
+        if interface_count == len(matching):
+            failure_stage = "interface"
+        elif interface_count == 0:
+            failure_stage = "execution"
+        else:
+            failure_stage = "mixed"
+
+        events.append({
+            "step_index": end,
+            "template": template,
+            "occurrences": count,
+            "failure_stage": failure_stage,
+            "failed_steps_before_trigger": end - streak_start + 1,
+        })
+        fired_in_streak = True
+
+    return events
+
+
 def analyze_task(record, repeat_threshold, window, failure_threshold):
     steps = sorted(record.get("steps", []) or [], key=lambda s: s.get("step_idx", 0))
     actions = [_normalized_action(step) for step in steps]
@@ -224,13 +332,24 @@ def analyze_task(record, repeat_threshold, window, failure_threshold):
         state_hash_steps += int(have)
         stable_transitions.append(have and pre == post)
 
-    origins = Counter()
-    for step in steps:
-        origin = _compile_origin(step)
-        if origin:
-            origins[origin] += 1
+    step_origins = [_compile_origin(step) for step in steps]
+    origins = Counter(origin for origin in step_origins if origin)
+    interface_events = _interface_failure_events(steps, errors, step_origins)
+    loop_events = _confirmed_failure_loop_events(
+        errors, templates, step_origins, window, failure_threshold
+    )
 
-    interface_failure = bool(origins["parse_validation"] or origins["dispatch_wrapper"])
+    for event in loop_events:
+        index = event["step_index"]
+        event["clean_within_two"] = any(
+            not _is_terminal_step(steps[candidate])
+            and _crossed_interface(step_origins[candidate])
+            and not errors[candidate]
+            for candidate in range(index + 1, min(len(steps), index + 3))
+        )
+
+    interface_failure = bool(interface_events)
+    confirmed_failure_loop = bool(loop_events)
     repeated_action = _repeated_value_run(actions, repeat_threshold)
     repeated_state = _max_true_run(stable_transitions) >= repeat_threshold
     accumulated_failure = _rolling_count(errors, window, failure_threshold)
@@ -244,6 +363,7 @@ def analyze_task(record, repeat_threshold, window, failure_threshold):
 
     signals = {
         "action_interface_failure": interface_failure,
+        "confirmed_failure_loop": confirmed_failure_loop,
         "repeated_action": repeated_action,
         "repeated_state": repeated_state,
         "accumulated_failure": accumulated_failure,
@@ -256,6 +376,8 @@ def analyze_task(record, repeat_threshold, window, failure_threshold):
         "state_hash_steps": state_hash_steps,
         "signals": signals,
         "origins": origins,
+        "interface_events": interface_events,
+        "loop_events": loop_events,
         "action_preview": " > ".join(_action_sig(s) or "unknown" for s in steps)[:500],
         "error_preview": " | ".join(t for t in templates if t)[:500],
     }
@@ -267,6 +389,74 @@ def _rate(successes, count):
 
 def _fmt_rate(value):
     return "   -" if math.isnan(value) else f"{value:5.1f}%"
+
+
+def _print_recovery_events(tasks):
+    interface_rows = [
+        (task, event)
+        for task in tasks
+        for event in task["analysis"]["interface_events"]
+    ]
+    interface_tasks = [
+        task for task in tasks if task["analysis"]["interface_events"]
+    ]
+    next_observed = sum(event["has_next"] for _, event in interface_rows)
+    next_dispatch = sum(event["next_dispatch"] for _, event in interface_rows)
+    interface_clean = sum(event["clean_within_two"] for _, event in interface_rows)
+    interface_task_sr = _rate(
+        sum(task["success"] for task in interface_tasks), len(interface_tasks)
+    )
+
+    loop_rows = [
+        (task, event)
+        for task in tasks
+        for event in task["analysis"]["loop_events"]
+    ]
+    loop_tasks = [task for task in tasks if task["analysis"]["loop_events"]]
+    loop_clean = sum(event["clean_within_two"] for _, event in loop_rows)
+    failed_before = sum(
+        event["failed_steps_before_trigger"] for _, event in loop_rows
+    )
+    loop_task_sr = _rate(sum(task["success"] for task in loop_tasks), len(loop_tasks))
+    stages = Counter(event["failure_stage"] for _, event in loop_rows)
+
+    print("\n[RECOVERY EVENT ANALYSIS -- local opportunities, not causal effects]")
+    if interface_rows:
+        print(
+            "  interface failure: "
+            f"events={len(interface_rows)} tasks={len(interface_tasks)} "
+            f"unexecuted_attempts={len(interface_rows)} task_success={_fmt_rate(interface_task_sr)}"
+        )
+        print(
+            "    next recorded action crossed interface: "
+            f"{next_dispatch}/{next_observed} "
+            f"({_fmt_rate(_rate(next_dispatch, next_observed))})"
+        )
+        print(
+            "    non-error, non-terminal execution within 2 recorded steps: "
+            f"{interface_clean}/{len(interface_rows)} "
+            f"({_fmt_rate(_rate(interface_clean, len(interface_rows)))})"
+        )
+    else:
+        print("  interface failure: events=0")
+
+    if loop_rows:
+        print(
+            "  confirmed failure loop: "
+            f"events={len(loop_rows)} tasks={len(loop_tasks)} "
+            f"stages={dict(stages)} task_success={_fmt_rate(loop_task_sr)}"
+        )
+        print(
+            "    failed steps consumed before trigger: "
+            f"total={failed_before} avg={failed_before / len(loop_rows):.1f}"
+        )
+        print(
+            "    non-error, non-terminal execution within 2 recorded steps: "
+            f"{loop_clean}/{len(loop_rows)} "
+            f"({_fmt_rate(_rate(loop_clean, len(loop_rows)))})"
+        )
+    else:
+        print("  confirmed failure loop: events=0")
 
 
 def print_group(name, tasks, top):
@@ -286,7 +476,9 @@ def print_group(name, tasks, top):
     print("compile/error origin observations:", dict(origin_counts) or "(none)")
     print("NOTE: parser attempts that produced actions=[] are absent from current audits.")
 
-    print("\n[PREDICTIVE SIGNALS]")
+    _print_recovery_events(tasks)
+
+    print("\n[TASK-LEVEL SIGNAL ASSOCIATIONS -- descriptive, not causal]")
     print(f"  {'signal':30s} {'tasks':>7s} {'task%':>7s} {'succ':>7s} {'succ(no)':>9s} {'fail-gap':>9s}")
     for signal in _PRIMARY_SIGNALS:
         with_signal = [t for t in tasks if t["analysis"]["signals"][signal]]
@@ -394,8 +586,9 @@ def main():
     print("Intra-task recovery trigger probe (READ-ONLY)")
     print(f"audits={len(audits)} task_instances={len(tasks)} malformed_lines={malformed_lines}")
     print(f"window={args.window} failure_threshold={args.threshold} repeat_threshold={args.repeat}")
-    print("Signals align with repeated actions / repeated states / accumulated action errors;")
-    print("low-level actions are diagnostics only. No parser, Omni, ledger, or runner behavior is changed.")
+    print("Candidate recovery events are action-interface failures and confirmed failure loops;")
+    print("broader repetition/low-level signals remain descriptive diagnostics only.")
+    print("No parser, Omni, ledger, or runner behavior is changed.")
 
     by_domain = defaultdict(list)
     for task in tasks:
