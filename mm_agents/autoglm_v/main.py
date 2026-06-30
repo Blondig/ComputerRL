@@ -1,3 +1,4 @@
+import ast
 import logging
 import re
 from base64 import b64encode
@@ -123,7 +124,7 @@ class AutoGLMAgent:
         
         Agent.relative_coordinate = relative_coordinate
 
-        # Intra-task action-interface repair (B) -- independent of Omni / ledger / parser.
+        # Intra-task action-interface repair -- independent of Omni / ledger / parser.
         self.use_recovery = use_recovery
 
         self.contents = []
@@ -216,15 +217,15 @@ class AutoGLMAgent:
         if mem_context and mem_target == "user":
             prompt += "\n\n" + mem_context
 
-        # action-interface repair (B): on a same-step regeneration, append a hard output
-        # contract. The caller also passes history=[] so the degenerate prior turns (the
-        # echo source) are NOT in context -- this is what lets the model break the loop.
+        # action-interface repair (L2): on a same-step regeneration, append a hard
+        # output contract. The caller passes only a short recent history window so the
+        # model keeps local task state without replaying the full echo-prone trace.
         if repair:
             prompt += (
                 "\n\n* Recovery: your previous response did NOT enter the execution channel "
                 "(it produced no parseable/executable action). Keep your current intent and "
                 "return ONLY one fenced python code block containing a single executable "
-                "action. No explanation, no prose, do not repeat text."
+                "action for the current screen. No explanation, no prose, do not repeat text."
             )
 
         content = [{"type": "text", "text": prompt}]
@@ -255,17 +256,7 @@ class AutoGLMAgent:
             action = actions[0]
             logger.info(f"The pesudo action is {action}")
 
-            if "Agent." in action:
-                actions = [
-                    eval(action),
-                ]
-            elif "BrowserTools." in action:  # TODO: special check for BrowserTools
-                actions = [
-                    eval(action),
-                ]
-            else:
-                actions = Agent.tool_commands(action, obs["cur_app"].strip().replace("-", "_").lower())
-                logger.info(f"The grounded action is {actions[0]}")
+            actions = self._ground_action(action, obs)
         except Exception as e:
             print("Failed to parse action from response", e)
             actions = []
@@ -287,6 +278,16 @@ class AutoGLMAgent:
 
         return actions, interface_ok, fingerprint
 
+    def _ground_action(self, action, obs):
+        action = action.strip()
+        if action.startswith("Agent."):
+            return [eval(action)]
+        if action.startswith("BrowserTools."):  # TODO: special check for BrowserTools
+            return [eval(action)]
+        actions = Agent.tool_commands(action, obs["cur_app"].strip().replace("-", "_").lower())
+        logger.info(f"The grounded action is {actions[0]}")
+        return actions
+
     @staticmethod
     def _interface_check(command):
         """compile() the grounded command without running it. ANY compile rejection
@@ -299,8 +300,8 @@ class AutoGLMAgent:
         except Exception as e:
             return False, _recovery_fingerprint("compile", e)
 
-    # ---- action-interface repair (B): same-step, context-isolated regeneration -----
-    MAX_REPAIR = 2   # repair regenerations per step
+    # ---- action-interface repair --------------------------------------------------
+    MAX_REPAIR = 2   # L2 model regenerations per step; L1 is zero-LLM contract repair.
 
     def _gen(self, messages):
         assert self.gen_func is not None, "gen_func is not set"
@@ -310,6 +311,95 @@ class AutoGLMAgent:
             except Exception as e:
                 logger.error("Failed to call gen_func, Error: " + str(e))
         raise RuntimeError("Failed to call gen_func after retries")
+
+    @staticmethod
+    def _content_text(obj):
+        if isinstance(obj, str):
+            return obj
+        if isinstance(obj, list):
+            return "\n".join(AutoGLMAgent._content_text(x) for x in obj)
+        if isinstance(obj, dict):
+            if "text" in obj:
+                return AutoGLMAgent._content_text(obj["text"])
+            if "content" in obj:
+                return AutoGLMAgent._content_text(obj["content"])
+        return ""
+
+    @classmethod
+    def _response_text(cls, response):
+        if isinstance(response, (list, dict)):
+            return cls._content_text(response)
+        text = str(response)
+        stripped = text.strip()
+        if stripped.startswith(("[", "{")):
+            try:
+                parsed = ast.literal_eval(stripped)
+            except Exception:
+                return text
+            parsed_text = cls._content_text(parsed)
+            return parsed_text or text
+        return text
+
+    def _allowed_action_prefixes(self, obs):
+        prefixes = ["Agent"]
+        tool_name = obs.get("cur_app", "").strip().lower().replace("-", "_")
+        if tool_name in self.tool_list:
+            prefixes.append(self.tool_list[tool_name])
+        return prefixes
+
+    @staticmethod
+    def _strip_code_noise(code):
+        code = (code or "").strip()
+        code = re.sub(r"^\s*python\\n", "", code, flags=re.IGNORECASE).strip()
+        code = re.sub(r"^\s*python\s*\n", "", code, flags=re.IGNORECASE).strip()
+        if code.endswith("\\n"):
+            code = code[:-2].strip()
+        return code
+
+    @staticmethod
+    def _find_action_calls(text, prefixes):
+        if not text:
+            return []
+        prefix_re = "|".join(re.escape(p) for p in prefixes)
+        # Narrow by construction: one current-response call with no nested parentheses.
+        call_re = re.compile(
+            rf"\b(?:{prefix_re})\.\w+\((?:[^()]|'[^'\\]*(?:\\.[^'\\]*)*'|\"[^\"\\]*(?:\\.[^\"\\]*)*\")*\)",
+            re.DOTALL,
+        )
+        return [m.group(0).strip() for m in call_re.finditer(text)]
+
+    def _contract_repair(self, response, obs):
+        """L1: keep the model's current action, repair only the submission contract."""
+        text = self._response_text(response)
+        prefixes = self._allowed_action_prefixes(obs)
+
+        candidates = []
+        for code in parse_code_from_string(text):
+            code = self._strip_code_noise(code)
+            candidates.extend(self._find_action_calls(code, prefixes))
+        if not candidates:
+            candidates = self._find_action_calls(text, prefixes)
+
+        unique = list(dict.fromkeys(candidates))
+        if len(unique) != 1:
+            logger.info("ActionRepair(L1): skip contract repair; candidates=%d", len(unique))
+            return None
+
+        action = unique[0]
+        try:
+            actions = self._ground_action(action, obs)
+            if actions and isinstance(actions[0], str):
+                interface_ok, _fingerprint = self._interface_check(actions[0])
+                if not interface_ok:
+                    logger.info("ActionRepair(L1): candidate failed interface check: %s", action)
+                    return None
+        except Exception as e:
+            logger.info("ActionRepair(L1): candidate failed grounding: %s", e)
+            return None
+
+        repaired_response = "```python\n{}\n```".format(action)
+        logger.info("ActionRepair(L1): contract repaired action=%s", action)
+        return repaired_response, actions
 
     def format_history(self, current_exe_result="", max_turns=30):
         history = []
@@ -390,17 +480,26 @@ class AutoGLMAgent:
         logger.info("RESPONSE: %s", response)
         actions, interface_ok, fingerprint = self.execute(response, obs)
 
-        # Action-interface repair (B): the action did NOT cross the execution interface
-        # (our serialization/degeneration, not tool feedback). Regenerate THIS step under
-        # an isolated minimal context (history=[] kills the echo source) + a hard output
-        # contract, with the SAME decoding -- the model rewrites a submittable action itself.
+        repair_level = None
         attempt = 0
+        if self.use_recovery and not interface_ok:
+            repaired = self._contract_repair(response, obs)
+            if repaired is not None:
+                response, actions = repaired
+                interface_ok, fingerprint = True, ""
+                repair_level = "L1_contract"
+
+        # L2: if L1 cannot preserve a single current-response action, regenerate once
+        # with a short existing history window (last user/assistant pair) instead of the
+        # full echo-prone trace or a totally blank history.
         while self.use_recovery and not interface_ok and attempt < self.MAX_REPAIR:
-            repair_msgs = self.prepare(instruction, obs, history=[], repair=True)
-            logger.info("ActionRepair: attempt=%d/%d", attempt + 1, self.MAX_REPAIR)
+            repair_history = history[-2:] if history else []
+            repair_msgs = self.prepare(instruction, obs, history=repair_history, repair=True)
+            logger.info("ActionRepair(L2): attempt=%d/%d", attempt + 1, self.MAX_REPAIR)
             response = self._gen(repair_msgs)
-            logger.info("RESPONSE(repair): %s", response)
+            logger.info("RESPONSE(repair-L2): %s", response)
             actions, interface_ok, fingerprint = self.execute(response, obs)
+            repair_level = "L2_regen"
             attempt += 1
 
         # Per-step diagnostic for failure attribution. No early stop: if repair didn't
@@ -409,7 +508,9 @@ class AutoGLMAgent:
         if self.use_recovery:
             logger.info("IntraRecovery: %s", {"interface_ok": interface_ok,
                                               "fingerprint": fingerprint,
-                                              "repaired": attempt > 0, "attempts": attempt})
+                                              "repaired": repair_level is not None,
+                                              "repair_level": repair_level,
+                                              "attempts": attempt})
 
         # update the contents
         self.contents.append(
