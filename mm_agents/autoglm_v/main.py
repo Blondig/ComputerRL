@@ -430,7 +430,7 @@ class AutoGLMAgent:
             return
         from omni_memory import OmniMemoryOrchestrator, OmniMemoryConfig
         config = OmniMemoryConfig()
-        config.embedding.model_name = "all-MiniLM-L6-v2"
+        config.embedding.model_name = "/home/c84445977/minilm"
         config.embedding.embedding_dim = 384
         config.llm.summary_model = self._omni_llm_model
         config.llm.query_model = self._omni_llm_model
