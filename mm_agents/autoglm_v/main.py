@@ -9,7 +9,6 @@ from .prompt.accessibility_tree_handle import linearize_accessibility_tree, trim
 from .prompt.grounding_agent import GroundingAgent as Agent
 from .tools.package.google_chrome import BrowserTools
 from .prompt.procedural_memory import Prompt
-from .intra_recovery import RecoveryMonitor
 
 logger = logging.getLogger("desktopenv.agent")
 
@@ -124,10 +123,8 @@ class AutoGLMAgent:
         
         Agent.relative_coordinate = relative_coordinate
 
-        # Intra-task action-interface recovery (independent of Omni / ledger / parser).
+        # Intra-task action-interface repair (B) -- independent of Omni / ledger / parser.
         self.use_recovery = use_recovery
-        self.recovery = RecoveryMonitor() if use_recovery else None
-        self._recovery_level = None     # hint pending for the NEXT prepare()
 
         self.contents = []
 
@@ -278,10 +275,10 @@ class AutoGLMAgent:
         # Returns whether the action crossed the interface + a normalized failure
         # fingerprint; the streak update / repair orchestration happen in predict().
         fingerprint = ""
-        if self.recovery is not None:
+        if self.use_recovery:
             if parse_exc is not None:
-                # discriminative fingerprint (stage+class+msg), NOT a flat "parse_failure",
-                # so three different parse/eval errors are not one L2 template.
+                # discriminative fingerprint (stage+class+msg); distinct failures keep
+                # distinct fingerprints (for the repair log / failure attribution).
                 fingerprint = _recovery_fingerprint("parse", parse_exc)
             elif actions and isinstance(actions[0], str):
                 # any STRING command must compile to have crossed the interface; a dict/
@@ -398,7 +395,7 @@ class AutoGLMAgent:
         # an isolated minimal context (history=[] kills the echo source) + a hard output
         # contract, with the SAME decoding -- the model rewrites a submittable action itself.
         attempt = 0
-        while self.recovery is not None and not interface_ok and attempt < self.MAX_REPAIR:
+        while self.use_recovery and not interface_ok and attempt < self.MAX_REPAIR:
             repair_msgs = self.prepare(instruction, obs, history=[], repair=True)
             logger.info("ActionRepair: attempt=%d/%d", attempt + 1, self.MAX_REPAIR)
             response = self._gen(repair_msgs)
@@ -406,12 +403,13 @@ class AutoGLMAgent:
             actions, interface_ok, fingerprint = self.execute(response, obs)
             attempt += 1
 
-        # One streak update per step (for the IntraRecovery log / failure attribution).
-        # No early stop: if repair didn't fix it, fall through like a normal parse failure.
-        # We only ever try to make the action CORRECT, never force a FAIL.
-        if self.recovery is not None:
-            self.recovery.step(interface_ok, fingerprint)
-            logger.info("IntraRecovery: %s", self.recovery.last_step)
+        # Per-step diagnostic for failure attribution. No early stop: if repair didn't
+        # fix it, fall through like a normal parse failure -- we only ever make the action
+        # CORRECT, never force a FAIL.
+        if self.use_recovery:
+            logger.info("IntraRecovery: %s", {"interface_ok": interface_ok,
+                                              "fingerprint": fingerprint,
+                                              "repaired": attempt > 0, "attempts": attempt})
 
         # update the contents
         self.contents.append(
@@ -440,9 +438,6 @@ class AutoGLMAgent:
         logger = _logger if _logger is not None else logging.getLogger("desktopenv.aguvis_agent")
 
         self.contents = []
-        self._recovery_level = None
-        if self.recovery is not None:
-            self.recovery.reset()
         self._init_omni()
 
     def _init_omni(self):
