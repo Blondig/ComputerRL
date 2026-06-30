@@ -135,7 +135,7 @@ class AutoGLMAgent:
     def turn_number(self):
         return len(self.contents)
 
-    def prepare(self, instruction: str, obs: Dict, history: List, last_result: str = "", recovery_hint: str = "") -> List:
+    def prepare(self, instruction: str, obs: Dict, history: List, last_result: str = "", repair: bool = False) -> List:
         """
         Predict the next action(s) based on the current observation.
         """
@@ -219,9 +219,16 @@ class AutoGLMAgent:
         if mem_context and mem_target == "user":
             prompt += "\n\n" + mem_context
 
-        # intra-task recovery hint (L1/L2) -- independent of any cross-task memory
-        if recovery_hint:
-            prompt += "\n\n" + recovery_hint
+        # action-interface repair (B): on a same-step regeneration, append a hard output
+        # contract. The caller also passes history=[] so the degenerate prior turns (the
+        # echo source) are NOT in context -- this is what lets the model break the loop.
+        if repair:
+            prompt += (
+                "\n\n* Recovery: your previous response did NOT enter the execution channel "
+                "(it produced no parseable/executable action). Keep your current intent and "
+                "return ONLY one fenced python code block containing a single executable "
+                "action. No explanation, no prose, do not repeat text."
+            )
 
         content = [{"type": "text", "text": prompt}]
         if self.with_image and obs.get('screenshot'):
@@ -267,8 +274,10 @@ class AutoGLMAgent:
             actions = []
             interface_ok, parse_exc = False, e
 
-        # Recovery monitoring runs ONLY when enabled -- the baseline (--recovery off)
-        # path does zero extra work (no fingerprint, no compile() interface check).
+        # Interface probe (only when recovery is on -- baseline does zero extra work).
+        # Returns whether the action crossed the interface + a normalized failure
+        # fingerprint; the streak update / repair orchestration happen in predict().
+        fingerprint = ""
         if self.recovery is not None:
             if parse_exc is not None:
                 # discriminative fingerprint (stage+class+msg), NOT a flat "parse_failure",
@@ -278,12 +287,8 @@ class AutoGLMAgent:
                 # any STRING command must compile to have crossed the interface; a dict/
                 # object action (eval'd Agent.*/BrowserTools.*) is already a valid action.
                 interface_ok, fingerprint = self._interface_check(actions[0])
-            else:
-                fingerprint = ""
-            self._recovery_level = self.recovery.step(interface_ok, fingerprint)
-            logger.info("IntraRecovery: %s", self.recovery.last_step)   # every step -> self-recovery rate
 
-        return actions
+        return actions, interface_ok, fingerprint
 
     @staticmethod
     def _interface_check(command):
@@ -296,6 +301,18 @@ class AutoGLMAgent:
             return True, ""
         except Exception as e:
             return False, _recovery_fingerprint("compile", e)
+
+    # ---- action-interface repair (B): same-step, context-isolated regeneration -----
+    MAX_REPAIR = 2   # repair regenerations per step
+
+    def _gen(self, messages):
+        assert self.gen_func is not None, "gen_func is not set"
+        for _ in range(3):
+            try:
+                return self.gen_func(messages)
+            except Exception as e:
+                logger.error("Failed to call gen_func, Error: " + str(e))
+        raise RuntimeError("Failed to call gen_func after retries")
 
     def format_history(self, current_exe_result="", max_turns=30):
         history = []
@@ -369,28 +386,32 @@ class AutoGLMAgent:
         return result_indices
 
     def predict(self, instruction: str, obs: Dict) -> List:
-        # Recovery hint pending from the previous step's interface check (if any),
-        # injected into this turn's user message. (Recovery does NOT touch Omni history;
-        # the force-recent-under-Omni option was reverted and is deferred to a separate
-        # change for the Omni+Recovery condition.)
-        recovery_hint = RecoveryMonitor.hint_text(self._recovery_level) if self._recovery_level else ""
-        # history = self.format_history()
         history = self.format_history(obs.get("exe_result", ""))
-        messages = self.prepare(instruction, obs, history, recovery_hint=recovery_hint)
+        messages = self.prepare(instruction, obs, history)
 
-        assert self.gen_func is not None, "gen_func is not set"
-        for _ in range(3):
-            try:
-                response = self.gen_func(messages)
-                break
-            except Exception as e:
-                logger.error("Failed to call gen_func, Error: " + str(e))
-        else:
-            raise RuntimeError("Failed to call gen_func after retries")
-
+        response = self._gen(messages)
         logger.info("RESPONSE: %s", response)
+        actions, interface_ok, fingerprint = self.execute(response, obs)
 
-        actions = self.execute(response, obs)
+        # Action-interface repair (B): the action did NOT cross the execution interface
+        # (our serialization/degeneration, not tool feedback). Regenerate THIS step under
+        # an isolated minimal context (history=[] kills the echo source) + a hard output
+        # contract, with the SAME decoding -- the model rewrites a submittable action itself.
+        attempt = 0
+        while self.recovery is not None and not interface_ok and attempt < self.MAX_REPAIR:
+            repair_msgs = self.prepare(instruction, obs, history=[], repair=True)
+            logger.info("ActionRepair: attempt=%d/%d", attempt + 1, self.MAX_REPAIR)
+            response = self._gen(repair_msgs)
+            logger.info("RESPONSE(repair): %s", response)
+            actions, interface_ok, fingerprint = self.execute(response, obs)
+            attempt += 1
+
+        # One streak update per step (for the IntraRecovery log / failure attribution).
+        # No early stop: if repair didn't fix it, fall through like a normal parse failure.
+        # We only ever try to make the action CORRECT, never force a FAIL.
+        if self.recovery is not None:
+            self.recovery.step(interface_ok, fingerprint)
+            logger.info("IntraRecovery: %s", self.recovery.last_step)
 
         # update the contents
         self.contents.append(

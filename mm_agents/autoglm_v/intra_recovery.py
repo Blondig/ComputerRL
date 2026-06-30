@@ -77,8 +77,7 @@ class RecoveryMonitor:
         elif len(self._streak) <= 2 and not self._l2_fired:
             level = "L1"            # only the 1st/2nd interface failure of a streak
         else:
-            # streak grew past 2 without a same-template loop (heterogeneous failures),
-            # or already escalated -> stay silent; do NOT keep polluting the prompt.
+            # already escalated / heterogeneous failures -> no level (diagnostic only).
             level = None
 
         self.last_step = {"interface_ok": False, "fingerprint": self._streak[-1], "level": level,
