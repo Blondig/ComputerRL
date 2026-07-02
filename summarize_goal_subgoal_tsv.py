@@ -317,18 +317,22 @@ def stable_prefix(rows: Sequence[SeqRow], max_len: int, support: float) -> Tuple
     if not pass_rows:
         return [], 0.0
     prefix: List[str] = []
+    active_rows = list(pass_rows)
     for idx in range(max_len):
-        counts = Counter(row.l1_seq[idx] for row in pass_rows if len(row.l1_seq) > idx)
+        counts = Counter(row.l1_seq[idx] for row in active_rows if len(row.l1_seq) > idx)
         if not counts:
             break
         token, count = counts.most_common(1)[0]
-        if count / len(pass_rows) < support:
+        candidate = prefix + [token]
+        candidate_rows = [row for row in pass_rows if row.l1_seq[: len(candidate)] == candidate]
+        candidate_support = len(candidate_rows) / len(pass_rows)
+        if candidate_support < support:
             break
-        prefix.append(token)
+        prefix = candidate
+        active_rows = candidate_rows
     if not prefix:
         return [], 0.0
-    support_count = sum(1 for row in pass_rows if row.l1_seq[: len(prefix)] == prefix)
-    return prefix, support_count / len(pass_rows)
+    return prefix, len(active_rows) / len(pass_rows)
 
 
 def sequence_patterns(rows: Sequence[SeqRow], max_len: int = 6) -> Counter:
