@@ -18,7 +18,7 @@ Typical remote usage:
 Useful extras:
 
   --baseline-root /path/to/baseline_results
-  --audit /path/to/ledger.v3.audit.jsonl
+  --audit /path/to/ledger.v3.audit.jsonl     # optional: run-root also auto-reads args.json/error_ledger
   --log /path/to/runtime.log
   --min-goal-size 4
 """
@@ -673,6 +673,62 @@ def collect_files(run_roots: Sequence[str], explicit: Sequence[str], patterns: S
         for pat in patterns:
             files.extend(glob.glob(os.path.join(root, "**", pat), recursive=True))
     return sorted(set(files))
+
+
+def sidecar_paths_for_ledger(ledger_path: str) -> Tuple[str, str, str]:
+    base, _ext = os.path.splitext(ledger_path)
+    return base + ".v3.audit.jsonl", base + ".audit.jsonl", base + ".v3.json"
+
+
+def candidate_ledger_paths(raw_path: str, args_json_path: str = "") -> List[str]:
+    if not raw_path:
+        return []
+    out = [raw_path]
+    if not os.path.isabs(raw_path):
+        out.append(os.path.abspath(raw_path))
+        if args_json_path:
+            out.append(os.path.join(os.path.dirname(args_json_path), raw_path))
+    return list(dict.fromkeys(out))
+
+
+def discover_ledger_sidecars(run_roots: Sequence[str], manifest: List[ManifestEntry]) -> Tuple[List[str], List[str]]:
+    """Find v2/v3 ledger sidecars implied by result dirs and saved args.json."""
+    audits: List[str] = []
+    banks: List[str] = []
+    tried = 0
+
+    def add_from_ledger_path(raw_path: str, args_json_path: str = "") -> None:
+        nonlocal tried
+        for ledger_path in candidate_ledger_paths(raw_path, args_json_path):
+            tried += 1
+            v3_audit, v2_audit, v3_bank = sidecar_paths_for_ledger(ledger_path)
+            for path in (v3_audit, v2_audit):
+                if os.path.isfile(path):
+                    audits.append(path)
+            if os.path.isfile(v3_bank):
+                banks.append(v3_bank)
+
+    for root in run_roots:
+        if not root:
+            continue
+        add_from_ledger_path(root)
+        for args_path in glob.glob(os.path.join(root, "**", "args.json"), recursive=True):
+            data = safe_json_load(args_path)
+            if not isinstance(data, dict):
+                continue
+            add_from_ledger_path(str(data.get("error_ledger") or ""), args_path)
+
+    audits = sorted(set(audits))
+    banks = sorted(set(banks))
+    manifest.append(
+        ManifestEntry(
+            kind="ledger_sidecar_discovery",
+            path=";".join(run_roots),
+            count=len(audits) + len(banks),
+            note="tried_ledger_bases={}".format(tried),
+        )
+    )
+    return audits, banks
 
 
 def parse_scores(roots: Sequence[str]) -> Dict[Tuple[str, str], float]:
@@ -1334,10 +1390,11 @@ def main() -> None:
     for root in schema_roots:
         manifest.append(ManifestEntry(kind="schema_root", path=root, count=sum(1 for k in api_desc if k)))
 
-    audit_files = collect_files(run_roots, args.audit, ["*.v3.audit.jsonl", "*.audit.jsonl"])
+    discovered_audits, discovered_banks = discover_ledger_sidecars(run_roots, manifest)
+    audit_files = collect_files(run_roots, args.audit + discovered_audits, ["*.v3.audit.jsonl", "*.audit.jsonl"])
     traj_files = collect_files(run_roots, args.traj, ["traj.jsonl"])
     log_files = collect_files(run_roots, args.log, ["runtime.log", "*.log", "debug*.log", "sdebug*.log", "normal*.log"])
-    bank_files = collect_files(run_roots, args.v3_bank, ["*.v3.json"])
+    bank_files = collect_files(run_roots, args.v3_bank + discovered_banks, ["*.v3.json"])
 
     observations = load_audit_observations(audit_files, run_roots, api_desc, manifest)
     merge_traj_observations(observations, traj_files, run_roots, api_desc, manifest)
