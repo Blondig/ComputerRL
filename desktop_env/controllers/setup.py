@@ -14,6 +14,8 @@ from typing import Any, Union, Optional
 from typing import Dict, List
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # proxy MITM self-signed cert -> verify=False below
 from playwright.sync_api import sync_playwright, TimeoutError
 from pydrive.auth import GoogleAuth
 from pydrive.drive import GoogleDrive, GoogleDriveFile, GoogleDriveFileList
@@ -132,7 +134,7 @@ class SetupController:
                 for i in range(max_retries):
                     try:
                         logger.info(f"Download attempt {i+1}/{max_retries} for {url}")
-                        response = requests.get(url, stream=True, timeout=300)  # Add 5 minute timeout
+                        response = requests.get(url, stream=True, timeout=300, verify=False)  # Add 5 minute timeout
                         response.raise_for_status()
                         
                         # Get file size if available
@@ -735,7 +737,7 @@ class SetupController:
                 params = config['args'][oid]
                 url = params['url']
                 with tempfile.NamedTemporaryFile(mode='wb', delete=False) as tmpf:
-                    response = requests.get(url, stream=True)
+                    response = requests.get(url, stream=True, verify=False)
                     response.raise_for_status()
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
@@ -820,7 +822,7 @@ class SetupController:
             e = None
             for i in range(max_retries):
                 try:
-                    response = requests.get(db_url, stream=True)
+                    response = requests.get(db_url, stream=True, verify=False)
                     response.raise_for_status()
 
                     with open(cache_path, 'wb') as f:

@@ -4,6 +4,8 @@ from typing import Dict, List, Set
 from typing import Optional, Any, Union
 from datetime import datetime
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # proxy MITM self-signed cert -> verify=False below
 import pandas as pd
 
 logger = logging.getLogger("desktopenv.getter.file")
@@ -60,7 +62,7 @@ def get_cloud_file(env, config: Dict[str, Any]) -> Union[str, List[str]]:
             continue
 
         url = p
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, verify=False)
         response.raise_for_status()
 
         with open(_path, 'wb') as f:
