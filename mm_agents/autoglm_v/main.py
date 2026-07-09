@@ -342,7 +342,7 @@ class AutoGLMAgent:
 
     def _allowed_action_prefixes(self, obs):
         prefixes = ["Agent"]
-        tool_name = obs.get("cur_app", "").strip().lower().replace("-", "_")
+        tool_name = (obs.get("cur_app") or "").strip().lower().replace("-", "_")
         if tool_name in self.tool_list:
             prefixes.append(self.tool_list[tool_name])
         return prefixes
@@ -480,27 +480,36 @@ class AutoGLMAgent:
         logger.info("RESPONSE: %s", response)
         actions, interface_ok, fingerprint = self.execute(response, obs)
 
+        # Action-interface repair is BEST-EFFORT: it may only help, never crash a task the
+        # baseline handled. The whole L1/L2 block is guarded -- on ANY failure we restore
+        # the un-repaired (baseline) action, so use_recovery can never regress robustness.
+        base_actions, base_ok, base_fp = actions, interface_ok, fingerprint
         repair_level = None
         attempt = 0
         if self.use_recovery and not interface_ok:
-            repaired = self._contract_repair(response, obs)
-            if repaired is not None:
-                response, actions = repaired
-                interface_ok, fingerprint = True, ""
-                repair_level = "L1_contract"
+            try:
+                repaired = self._contract_repair(response, obs)   # L1: zero-LLM contract repair
+                if repaired is not None:
+                    response, actions = repaired
+                    interface_ok, fingerprint = True, ""
+                    repair_level = "L1_contract"
 
-        # L2: if L1 cannot preserve a single current-response action, regenerate once
-        # with a short existing history window (last user/assistant pair) instead of the
-        # full echo-prone trace or a totally blank history.
-        while self.use_recovery and not interface_ok and attempt < self.MAX_REPAIR:
-            repair_history = history[-2:] if history else []
-            repair_msgs = self.prepare(instruction, obs, history=repair_history, repair=True)
-            logger.info("ActionRepair(L2): attempt=%d/%d", attempt + 1, self.MAX_REPAIR)
-            response = self._gen(repair_msgs)
-            logger.info("RESPONSE(repair-L2): %s", response)
-            actions, interface_ok, fingerprint = self.execute(response, obs)
-            repair_level = "L2_regen"
-            attempt += 1
+                # L2: if L1 cannot isolate a single current-response action, regenerate once
+                # with a short recent-history window (keeps local task state) instead of the
+                # full echo-prone trace or a totally blank history.
+                while not interface_ok and attempt < self.MAX_REPAIR:
+                    repair_history = history[-2:] if history else []
+                    repair_msgs = self.prepare(instruction, obs, history=repair_history, repair=True)
+                    logger.info("ActionRepair(L2): attempt=%d/%d", attempt + 1, self.MAX_REPAIR)
+                    response = self._gen(repair_msgs)
+                    logger.info("RESPONSE(repair-L2): %s", response)
+                    actions, interface_ok, fingerprint = self.execute(response, obs)
+                    repair_level = "L2_regen"
+                    attempt += 1
+            except Exception as e:
+                logger.warning("ActionRepair aborted (%s); falling back to baseline action", e)
+                actions, interface_ok, fingerprint = base_actions, base_ok, base_fp
+                repair_level = "aborted"
 
         # Per-step diagnostic for failure attribution. No early stop: if repair didn't
         # fix it, fall through like a normal parse failure -- we only ever make the action
