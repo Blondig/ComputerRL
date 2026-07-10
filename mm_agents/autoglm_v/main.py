@@ -1,5 +1,6 @@
 import ast
 import logging
+import os
 import re
 from base64 import b64encode
 from PIL import Image
@@ -560,4 +561,10 @@ class AutoGLMAgent:
         config.embedding.embedding_dim = 384
         config.llm.summary_model = self._omni_llm_model
         config.llm.query_model = self._omni_llm_model
+        # OmniMemory's LLMConfig reads OPENAI_API_BASE (not OPENAI_BASE_URL) and
+        # falls back to api.openai.com, so point it at the same endpoint the main
+        # agent uses; otherwise internal LLM calls hang on the corporate proxy.
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        if base_url:
+            config.llm.api_base_url = base_url
         self._omni = OmniMemoryOrchestrator(config=config, data_dir=self._omni_data_dir)
