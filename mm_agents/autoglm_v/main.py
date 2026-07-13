@@ -484,6 +484,7 @@ class AutoGLMAgent:
         # Action-interface repair is BEST-EFFORT: it may only help, never crash a task the
         # baseline handled. The whole L1/L2 block is guarded -- on ANY failure we restore
         # the un-repaired (baseline) action, so use_recovery can never regress robustness.
+        base_response = response
         base_actions, base_ok, base_fp = actions, interface_ok, fingerprint
         repair_level = None
         attempt = 0
@@ -491,7 +492,10 @@ class AutoGLMAgent:
             try:
                 repaired = self._contract_repair(response, obs)   # L1: zero-LLM contract repair
                 if repaired is not None:
-                    response, actions = repaired
+                    # Execute the repaired action but keep the model's original response
+                    # in contents/history/logs: overwriting it with the bare code block
+                    # strips the <think> trail and induces replay loops on later turns.
+                    _, actions = repaired
                     interface_ok, fingerprint = True, ""
                     repair_level = "L1_contract"
 
@@ -509,6 +513,10 @@ class AutoGLMAgent:
                     attempt += 1
             except Exception as e:
                 logger.warning("ActionRepair aborted (%s); falling back to baseline action", e)
+                # restore the response together with the action: a first L2 pass may
+                # already have overwritten it, and history/logs must never carry a
+                # response whose action was not the one executed.
+                response = base_response
                 actions, interface_ok, fingerprint = base_actions, base_ok, base_fp
                 repair_level = "aborted"
 
@@ -521,6 +529,13 @@ class AutoGLMAgent:
                                               "repaired": repair_level is not None,
                                               "repair_level": repair_level,
                                               "attempts": attempt})
+
+        # contents / Omni / traj.jsonl are text channels, but gen_func may return
+        # list/dict content blocks (a dict would crash response[:800] below, a list
+        # would nest into the next turn's text field via format_history). Textify
+        # only non-str responses -- plain strings stay byte-identical to baseline.
+        if not isinstance(response, str):
+            response = self._response_text(response) or str(response)
 
         # update the contents
         self.contents.append(
