@@ -3,18 +3,17 @@ Read-only feasibility probe for stall-triggered online procedure memory.
 
 The existing divergence probe asks whether a failing trajectory made a wrong
 choice after an exact shared prefix. This probe asks the complementary question:
-once an action has crossed the execution boundary but the GUI stops changing,
-does another successful task contain a state-compatible subgoal transition that
-could supply an alternative route?
+once post-boundary behavior repeats or visibly stops progressing, does another
+successful task contain a state-compatible subgoal transition that could supply
+an alternative route?
 
 The probe deliberately reads raw executed trajectories and screenshots first.
 It does not use v3 action signatures to define procedures, and it never mutates
 the run directories.
 
 For every failed episode it:
-  1. Finds the first verified post-execution stall: a repeated action, low-level
-     action run, or execution-error run whose post-action screenshots stay
-     unchanged.
+  1. Finds the first mutually exclusive stall trigger: a repeated normalized
+     post-boundary error, an exact action repeat, or a static low-level select run.
   2. Excludes network blocks, infrastructure failures, and pre-boundary errors.
   3. Ranks state-changing transitions from other successful tasks by app, goal,
      current subgoal/history, instruction, and pre-state screenshot similarity.
@@ -22,6 +21,10 @@ For every failed episode it:
        oracle -- all other successful tasks are available;
        online -- only successful tasks completed earlier in the same run root
                  (or across roots with --online-scope all) are available.
+
+Low-level typing is intentionally outside the no-progress rule because thumbnail
+similarity can miss productive text edits. Exact repeats may trigger with unknown
+state evidence; low-level select runs require positive static-screen evidence.
 
 Pillow (already declared by ComputerRL) is used for fast screenshot decoding. A
 small deterministic stdlib PNG fallback keeps the probe usable in bare shells.
@@ -52,7 +55,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from analyze_goal_subgoal_gap import (
-    LOWLEVEL_L1,
     OBJ_RULES,
     OP_RULES,
     TaskInfo,
@@ -146,6 +148,21 @@ def _action_template(action: Any) -> str:
     return re.sub(r"\s+", "", text)
 
 
+def _error_template(text: Any) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    picked = next(
+        (line for line in reversed(lines) if re.search(r"(Error|Exception)\b", line, re.IGNORECASE)),
+        lines[-1],
+    )
+    picked = re.sub(r"'[^']*'", "'X'", picked)
+    picked = re.sub(r'"[^"]*"', '"X"', picked)
+    picked = re.sub(r"0x[0-9a-fA-F]+", "0xN", picked)
+    picked = re.sub(r"\b\d+\b", "N", picked)
+    return re.sub(r"\s+", " ", picked).lower()[:240]
+
+
 def _timestamp(raw: Any) -> Optional[float]:
     text = str(raw or "")
     m = re.search(r"(\d{8})@(\d{6})", text)
@@ -212,6 +229,7 @@ class TraceStep:
     l1: str = ""
     l2: str = ""
     error_class: str = ""
+    error_template: str = ""
 
 
 @dataclass
@@ -241,7 +259,9 @@ class StallEvent:
     episode: Episode
     step_pos: int
     window_start: int
-    reason: str
+    stall_type: str
+    trigger_rule: str
+    state_evidence: str
     state_similarity: Optional[float]
     eligible: bool
     exclusion_reason: str
@@ -520,6 +540,7 @@ def _load_steps(traj_path: str, task_dir: str, api_desc: Dict[str, str]) -> List
                     l1=primary.l1 if primary else "",
                     l2=primary.l2 if primary else "",
                     error_class=error_class,
+                    error_template=_error_template(exe_result) if error_class else "",
                 )
             )
     return steps
@@ -595,38 +616,79 @@ def _context_l2(steps: Sequence[TraceStep], end_pos: int, limit: int) -> List[st
     return collapse_repeats(seq)[-limit:]
 
 
-def detect_first_stall(episode: Episode, images: ImageFingerprinter, args) -> Optional[StallEvent]:
-    if episode.success is not False or len(episode.steps) < args.min_stall_run:
+def _window_state_similarity(
+    window: Sequence[TraceStep],
+    images: ImageFingerprinter,
+) -> Optional[float]:
+    sims = [
+        images.similarity(window[i - 1].screenshot_path, window[i].screenshot_path)
+        for i in range(1, len(window))
+    ]
+    if not sims or any(sim is None for sim in sims):
         return None
-    missing_state_candidate: Optional[StallEvent] = None
-    for end in range(args.min_stall_run - 1, len(episode.steps)):
-        start = end - args.min_stall_run + 1
+    return min(sims)
+
+
+def detect_first_stall(episode: Episode, images: ImageFingerprinter, args) -> Optional[StallEvent]:
+    if episode.success is not False:
+        return None
+    for end in range(len(episode.steps)):
+        match: Optional[Tuple[int, str, str, Optional[float], str]] = None
+
+        if end + 1 >= args.error_repeat_threshold:
+            start = end - args.error_repeat_threshold + 1
+            window = episode.steps[start:end + 1]
+            templates = [step.error_template for step in window]
+            if templates[0] and len(set(templates)) == 1:
+                classes = {step.error_class for step in window}
+                if classes == {"execution"}:
+                    match = (start, "execution", "error_repeat", None, "unknown")
+                elif classes & {"representation", "no_action"}:
+                    match = (start, "", "error_repeat", None, "unknown")
+
+        if match is None and end + 1 >= args.exact_repeat_threshold:
+            start = end - args.exact_repeat_threshold + 1
+            window = episode.steps[start:end + 1]
+            if not any(step.error_class for step in window):
+                keys = [step.action_key for step in window]
+                if keys[0] and len(set(keys)) == 1:
+                    state_similarity = _window_state_similarity(window, images)
+                    if (
+                        state_similarity is None
+                        or state_similarity >= args.no_progress_threshold
+                    ):
+                        state_evidence = "unknown" if state_similarity is None else "static"
+                        match = (
+                            start, "no_progress", "exact_repeat",
+                            state_similarity, state_evidence,
+                        )
+
+        if match is None and end + 1 >= args.lowlevel_run_threshold:
+            start = end - args.lowlevel_run_threshold + 1
+            window = episode.steps[start:end + 1]
+            if not any(step.error_class for step in window):
+                keys = [step.action_key for step in window]
+                if (
+                    all(keys)
+                    and len(set(keys)) >= 2
+                    and all(step.l1 == "lowlevel_select" for step in window)
+                ):
+                    state_similarity = _window_state_similarity(window, images)
+                    if (
+                        state_similarity is not None
+                        and state_similarity >= args.no_progress_threshold
+                    ):
+                        match = (
+                            start, "no_progress", "lowlevel_static",
+                            state_similarity, "static",
+                        )
+
+        if match is None:
+            continue
+        start, stall_type, trigger_rule, state_similarity, state_evidence = match
         window = episode.steps[start:end + 1]
-        keys = [s.action_key for s in window]
-        same_action = bool(keys[0]) and len(set(keys)) == 1
-        lowlevel_run = all(s.l1 in LOWLEVEL_L1 for s in window)
-        execution_loop = all(s.error_class == "execution" for s in window)
-        if not (same_action or lowlevel_run or execution_loop):
-            continue
 
-        sims = [
-            images.similarity(window[i - 1].screenshot_path, window[i].screenshot_path)
-            for i in range(1, len(window))
-        ]
-        reason = "execution_error_loop" if execution_loop else (
-            "repeated_action" if same_action else "lowlevel_no_progress"
-        )
         query_id = "{}@{}".format(episode.episode_id, window[-1].ordinal)
-        if any(sim is None for sim in sims):
-            if missing_state_candidate is None:
-                missing_state_candidate = StallEvent(
-                    query_id, episode, end, start, reason, None, False, "missing_state_evidence"
-                )
-            continue
-        if not all(sim >= args.no_progress_threshold for sim in sims if sim is not None):
-            continue
-
-        state_similarity = min(sims) if sims else None
         text = _window_text(window)
         classes = {s.error_class for s in window if s.error_class}
         if classes & {"representation", "no_action"}:
@@ -635,6 +697,8 @@ def detect_first_stall(episode: Episode, images: ImageFingerprinter, args) -> Op
             exclusion = "network_block"
         elif _has_marker(text, INFRA_MARKERS) or _has_marker(episode.runtime_text, INFRA_MARKERS):
             exclusion = "infrastructure_failure"
+        elif not images.state(window[-1].screenshot_path).thumbnail:
+            exclusion = "missing_query_state"
         else:
             exclusion = ""
         return StallEvent(
@@ -642,12 +706,14 @@ def detect_first_stall(episode: Episode, images: ImageFingerprinter, args) -> Op
             episode=episode,
             step_pos=end,
             window_start=start,
-            reason=reason,
+            stall_type="" if exclusion else stall_type,
+            trigger_rule=trigger_rule,
+            state_evidence=state_evidence,
             state_similarity=state_similarity,
             eligible=not exclusion,
             exclusion_reason=exclusion,
         )
-    return missing_state_candidate
+    return None
 
 
 def build_donors(episodes: Sequence[Episode], images: ImageFingerprinter, args) -> List[DonorTransition]:
@@ -780,6 +846,8 @@ def _mode_summary(ranked: Sequence[dict], top_k: int) -> dict:
     top = unique[:top_k]
     compatible = [row for row in top if row["compatible"]]
     all_compatible = [row for row in unique if row["compatible"]]
+    template_compatible = [row for row in compatible if row["novel_template"]]
+    all_template_compatible = [row for row in all_compatible if row["novel_template"]]
     l2 = Counter(row["donor"].step.l2 or "unknown" for row in compatible)
     agreement = (l2.most_common(1)[0][1] / float(len(compatible))) if compatible else 0.0
     return {
@@ -788,6 +856,11 @@ def _mode_summary(ranked: Sequence[dict], top_k: int) -> dict:
         "covered_at_1": bool(top and top[0]["compatible"]),
         "covered_at_k": bool(compatible),
         "covered_any": bool(all_compatible),
+        "template_covered_at_1": bool(
+            top and top[0]["compatible"] and top[0]["novel_template"]
+        ),
+        "template_covered_at_k": bool(template_compatible),
+        "template_covered_any": bool(all_template_compatible),
         "support": len({row["donor"].episode.task_id for row in compatible}),
         "agreement": agreement,
         "top": top,
@@ -852,9 +925,14 @@ def analyze(episodes: Sequence[Episode], images: ImageFingerprinter, args):
             "step_num": event.step.step_num,
             "step_ordinal": event.step.ordinal,
             "window_start_ordinal": event.window_start,
-            "reason": event.reason,
+            "stall_type": event.stall_type,
+            "trigger_rule": event.trigger_rule,
+            "state_evidence": event.state_evidence,
             "eligible": int(event.eligible),
             "exclusion_reason": event.exclusion_reason,
+            "query_state_available": int(
+                bool(images.state(event.step.screenshot_path).thumbnail)
+            ),
             "stall_state_similarity": "" if event.state_similarity is None else round(event.state_similarity, 6),
             "stall_l1": event.step.l1,
             "stall_l2": event.step.l2,
@@ -867,6 +945,9 @@ def analyze(episodes: Sequence[Episode], images: ImageFingerprinter, args):
             "oracle_covered_at_1": int(oracle["covered_at_1"]),
             "oracle_covered_at_k": int(oracle["covered_at_k"]),
             "oracle_covered_any": int(oracle["covered_any"]),
+            "oracle_template_covered_at_1": int(oracle["template_covered_at_1"]),
+            "oracle_template_covered_at_k": int(oracle["template_covered_at_k"]),
+            "oracle_template_covered_any": int(oracle["template_covered_any"]),
             "oracle_support": oracle["support"],
             "oracle_agreement": round(oracle["agreement"], 6),
             "online_candidate_count": online["candidate_count"],
@@ -874,6 +955,9 @@ def analyze(episodes: Sequence[Episode], images: ImageFingerprinter, args):
             "online_covered_at_1": int(online["covered_at_1"]),
             "online_covered_at_k": int(online["covered_at_k"]),
             "online_covered_any": int(online["covered_any"]),
+            "online_template_covered_at_1": int(online["template_covered_at_1"]),
+            "online_template_covered_at_k": int(online["template_covered_at_k"]),
+            "online_template_covered_any": int(online["template_covered_any"]),
             "online_support": online["support"],
             "online_agreement": round(online["agreement"], 6),
         })
@@ -886,11 +970,13 @@ def build_state_similarity_null(
     images: ImageFingerprinter,
     args,
 ) -> Dict[str, dict]:
-    """Calibrate raw screenshot similarity without changing the retrieval gate.
+    """Calibrate raw screenshot similarity against same-app cross-task states.
 
     Each pair combines an eligible stall with one successful pre-state from a
     different task in the same app. Stable hashes select at most one transition
-    per donor task and cap work per app, so reruns are deterministic.
+    per donor task and cap work per app, so reruns are deterministic. The p95
+    sensitivity threshold affects the decision gate only after enough null pairs
+    are available.
     """
     queries_by_app: Dict[str, List[StallEvent]] = defaultdict(list)
     donors_by_app: Dict[str, List[DonorTransition]] = defaultdict(list)
@@ -924,18 +1010,54 @@ def build_state_similarity_null(
 
         sampled.sort(key=lambda item: item[0])
         values = [similarity for _key, similarity in sampled[:args.null_pairs_per_app]]
+        p95 = _quantile(values, 0.95)
+        gate_applied = len(values) >= args.min_null_pairs_for_gate and p95 is not None
         summaries[app] = {
             "queries": len(queries),
             "pairs": len(values),
             "p50": _quantile(values, 0.50),
             "p90": _quantile(values, 0.90),
-            "p95": _quantile(values, 0.95),
+            "p95": p95,
             "threshold_rate": (
                 sum(value >= args.candidate_state_threshold for value in values) / float(len(values))
                 if values else None
             ),
+            "gate_applied": gate_applied,
+            "calibrated_threshold": (
+                max(args.candidate_state_threshold, p95) if gate_applied else None
+            ),
         }
     return summaries
+
+
+def apply_null_calibration(
+    query_rows: Sequence[dict],
+    candidate_rows: Sequence[dict],
+    state_null: Dict[str, dict],
+    args,
+) -> None:
+    """Attach null-p95 sensitivity coverage to each query row in place."""
+    candidates: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
+    for candidate in candidate_rows:
+        candidates[(candidate["query_id"], candidate["mode"])].append(candidate)
+
+    for row in query_rows:
+        stats = state_null.get(row["app"], {})
+        applied = bool(stats.get("gate_applied"))
+        threshold = (
+            stats["calibrated_threshold"] if applied else args.candidate_state_threshold
+        )
+        threshold = round(threshold, 6)
+        row["null_calibration_pairs"] = int(stats.get("pairs", 0))
+        row["null_calibration_applied"] = int(applied)
+        row["null_calibrated_threshold"] = threshold
+        for mode in ("oracle", "online"):
+            covered = any(
+                candidate["novel_template"]
+                and candidate["state_similarity"] >= threshold
+                for candidate in candidates.get((row["query_id"], mode), [])
+            )
+            row["{}_null_calibrated_template_covered_at_k".format(mode)] = int(covered)
 
 
 def _coverage(rows: Sequence[dict], field: str, online_only: bool = False) -> Tuple[int, int]:
@@ -962,6 +1084,8 @@ def build_report(
     excluded = [row for row in query_rows if not row["eligible"]]
     exclusions = Counter(row["exclusion_reason"] or "unknown" for row in excluded)
     order_known = sum(row["online_order_known"] for row in eligible)
+    state_static = sum(row["state_evidence"] == "static" for row in eligible)
+    state_unknown = sum(row["state_evidence"] == "unknown" for row in eligible)
     episode_domains: Dict[Tuple[str, str], set] = defaultdict(set)
     for episode in episodes:
         episode_domains[(episode.root_id, episode.task_id)].add(episode.domain)
@@ -975,8 +1099,11 @@ def build_report(
         "- successful state-changing donor transitions: {} from {} unique tasks".format(
             len(donors), len({d.episode.task_id for d in donors})
         ),
-        "- first stall candidates: {} (state-verified and eligible {}, excluded {})".format(
+        "- first stall trigger candidates: {} (eligible {}, excluded {})".format(
             len(stalls), len(eligible), len(excluded)
+        ),
+        "- eligible stall evidence: static {}, unknown {}".format(
+            state_static, state_unknown
         ),
         "- eligible stalls with known online order: {}/{}".format(order_known, len(eligible)),
         "- task IDs present in multiple domain variants: {}".format(mixed_variant_tasks),
@@ -987,18 +1114,50 @@ def build_report(
         "",
         "## Stall Definition",
         "",
-        "- minimum run: {} executed actions".format(args.min_stall_run),
-        "- no-progress screenshot similarity: >= {:.4f}".format(args.no_progress_threshold),
+        "- execution-error repeat: {} consecutive identical normalized errors".format(
+            args.error_repeat_threshold
+        ),
+        "- exact repeat: {} error-free identical action keys; visible change vetoes the trigger, missing state is allowed".format(
+            args.exact_repeat_threshold
+        ),
+        "- low-level no progress: {} error-free lowlevel_select actions with at least two distinct keys and complete static evidence".format(
+            args.lowlevel_run_threshold
+        ),
+        "- static evidence requires every adjacent screenshot similarity >= {:.4f}".format(
+            args.no_progress_threshold
+        ),
+        "- representation/no_action, network, and infrastructure failures are routed out before retrieval",
+        "- lowlevel_input is not a no-progress trigger; the same {:.4f} cutoff defines donor state change".format(
+            args.no_progress_threshold
+        ),
         "- candidate pre-state similarity: >= {:.4f}".format(args.candidate_state_threshold),
         "- online scope: `{}`".format(args.online_scope),
         "",
     ])
 
-    reasons = Counter(event.reason for event in stalls)
-    lines.append("| detected stall | n |")
-    lines.append("| --- | ---: |")
-    for reason, count in reasons.most_common():
-        lines.append("| {} | {} |".format(reason, count))
+    trigger_rows: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
+    for row in query_rows:
+        trigger_rows[(row["stall_type"] or "routed_out", row["trigger_rule"])].append(row)
+    lines.append(
+        "| stall type | trigger rule | detected | eligible | static | unknown | "
+        "oracle novel-template @{} | online novel-template @{} |".format(args.top_k, args.top_k)
+    )
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for (stall_type, trigger_rule), rows in sorted(
+        trigger_rows.items(), key=lambda item: (-len(item[1]), item[0])
+    ):
+        trigger_eligible = [row for row in rows if row["eligible"]]
+        trigger_online = [row for row in trigger_eligible if row["online_order_known"]]
+        static_n = sum(row["state_evidence"] == "static" for row in trigger_eligible)
+        unknown_n = sum(row["state_evidence"] == "unknown" for row in trigger_eligible)
+        oracle_template_n = sum(row["oracle_template_covered_at_k"] for row in trigger_eligible)
+        online_template_n = sum(row["online_template_covered_at_k"] for row in trigger_online)
+        lines.append("| {} | {} | {} | {} | {} | {} | {}/{} ({}) | {}/{} ({}) |".format(
+            _md(stall_type), _md(trigger_rule), len(rows), len(trigger_eligible),
+            static_n, unknown_n,
+            oracle_template_n, len(trigger_eligible), _pct(oracle_template_n, len(trigger_eligible)),
+            online_template_n, len(trigger_online), _pct(online_template_n, len(trigger_online)),
+        ))
     if exclusions:
         lines.extend(["", "Excluded: " + ", ".join("{}={}".format(k, v) for k, v in exclusions.most_common())])
     lines.append("")
@@ -1007,50 +1166,73 @@ def build_report(
         "## State Similarity Null",
         "",
         "Deterministic same-app, cross-task stall/donor pairs before goal or subgoal filtering. "
-        "This calibration is report-only and does not alter compatibility or the decision gate.",
+        "Apps with at least {} null pairs use max(base threshold, null p95) as a decision-gate sensitivity check.".format(
+            args.min_null_pairs_for_gate
+        ),
         "A high null pass rate means raw retrieval coverage may reflect shared app chrome rather than reusable task state.",
         "",
-        "| app | eligible queries | sampled pairs | p50 | p90 | p95 | null >= {:.4f} |".format(
+        "| app | eligible queries | sampled pairs | p50 | p90 | p95 | null >= {:.4f} | gate threshold | gate applied |".format(
             args.candidate_state_threshold
         ),
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ])
     if not state_null:
-        lines.append("| - | 0 | 0 | - | - | - | - |")
+        lines.append("| - | 0 | 0 | - | - | - | - | - | no |")
     for app, stats in sorted(state_null.items()):
         fmt = lambda value: "-" if value is None else "{:.4f}".format(value)
         rate = "-" if stats["threshold_rate"] is None else "{:.1f}%".format(100 * stats["threshold_rate"])
-        lines.append("| {} | {} | {} | {} | {} | {} | {} |".format(
+        lines.append("| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
             _md(app), stats["queries"], stats["pairs"], fmt(stats["p50"]),
             fmt(stats["p90"]), fmt(stats["p95"]), rate,
+            fmt(stats["calibrated_threshold"]), "yes" if stats["gate_applied"] else "no",
         ))
     lines.append("")
 
     oracle_1 = _coverage(query_rows, "oracle_covered_at_1")
     oracle_k = _coverage(query_rows, "oracle_covered_at_k")
     oracle_any = _coverage(query_rows, "oracle_covered_any")
+    oracle_template_k = _coverage(query_rows, "oracle_template_covered_at_k")
+    oracle_null_template_k = _coverage(
+        query_rows, "oracle_null_calibrated_template_covered_at_k"
+    )
     online_1 = _coverage(query_rows, "online_covered_at_1", online_only=True)
     online_k = _coverage(query_rows, "online_covered_at_k", online_only=True)
     online_any = _coverage(query_rows, "online_covered_any", online_only=True)
+    online_template_k = _coverage(query_rows, "online_template_covered_at_k", online_only=True)
+    online_null_template_k = _coverage(
+        query_rows, "online_null_calibrated_template_covered_at_k", online_only=True
+    )
     lines.extend([
         "## Retrieval Coverage",
         "",
-        "| availability | compatible @1 | compatible @{} | compatible anywhere |".format(args.top_k),
-        "| --- | ---: | ---: | ---: |",
-        "| oracle | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) |".format(
+        "| availability | compatible @1 | compatible @{} | novel-template @{} | null-p95 novel-template @{} | compatible anywhere |".format(
+            args.top_k, args.top_k, args.top_k
+        ),
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        "| oracle | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) |".format(
             oracle_1[0], oracle_1[1], _pct(*oracle_1),
             oracle_k[0], oracle_k[1], _pct(*oracle_k),
+            oracle_template_k[0], oracle_template_k[1], _pct(*oracle_template_k),
+            oracle_null_template_k[0], oracle_null_template_k[1], _pct(*oracle_null_template_k),
             oracle_any[0], oracle_any[1], _pct(*oracle_any),
         ),
-        "| online | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) |".format(
+        "| online | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) |".format(
             online_1[0], online_1[1], _pct(*online_1),
             online_k[0], online_k[1], _pct(*online_k),
+            online_template_k[0], online_template_k[1], _pct(*online_template_k),
+            online_null_template_k[0], online_null_template_k[1], _pct(*online_null_template_k),
             online_any[0], online_any[1], _pct(*online_any),
         ),
         "",
     ])
 
-    lines.extend(["### By Domain", "", "| domain | eligible stalls | oracle @{} | online @{} |".format(args.top_k, args.top_k), "| --- | ---: | ---: | ---: |"])
+    lines.extend([
+        "### By Domain", "",
+        "| domain | eligible stalls | oracle @{} | oracle novel-template | oracle null-p95 | online @{} | online novel-template | online null-p95 |".format(
+            args.top_k, args.top_k
+        ),
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
     by_domain: Dict[str, List[dict]] = defaultdict(list)
     for row in eligible:
         by_domain[row["domain"]].append(row)
@@ -1058,39 +1240,69 @@ def build_report(
         rows = by_domain[domain]
         known = [r for r in rows if r["online_order_known"]]
         oc = sum(r["oracle_covered_at_k"] for r in rows)
+        oct_ = sum(r["oracle_template_covered_at_k"] for r in rows)
+        ocn = sum(r["oracle_null_calibrated_template_covered_at_k"] for r in rows)
         on = sum(r["online_covered_at_k"] for r in known)
-        lines.append("| {} | {} | {}/{} ({}) | {}/{} ({}) |".format(
+        ont = sum(r["online_template_covered_at_k"] for r in known)
+        onn = sum(r["online_null_calibrated_template_covered_at_k"] for r in known)
+        lines.append("| {} | {} | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) | {}/{} ({}) |".format(
             domain, len(rows), oc, len(rows), _pct(oc, len(rows)),
-            on, len(known), _pct(on, len(known))
+            oct_, len(rows), _pct(oct_, len(rows)),
+            ocn, len(rows), _pct(ocn, len(rows)),
+            on, len(known), _pct(on, len(known)),
+            ont, len(known), _pct(ont, len(known)),
+            onn, len(known), _pct(onn, len(known)),
         ))
     lines.append("")
 
+    null_gate_applied = any(
+        row["eligible"] and row["null_calibration_applied"] for row in query_rows
+    )
+    raw_template_ready = bool(
+        oracle_template_k[1]
+        and oracle_template_k[0] / float(oracle_template_k[1]) >= args.min_coverage
+    )
+    calibrated_template_ready = bool(
+        oracle_null_template_k[1]
+        and oracle_null_template_k[0] / float(oracle_null_template_k[1]) >= args.min_coverage
+    )
     if mixed_variant_tasks and not (args.domain or args.exclude_rewrite):
         verdict = "MIXED_VARIANTS_RERUN_SEPARATELY"
         explanation = "normal and fix_rewrite episodes share task IDs and are not independent queries"
     elif len(eligible) < args.min_queries:
         verdict = "INSUFFICIENT_SAMPLE"
-        explanation = "too few eligible post-execution stalls for a decision"
-    elif oracle_k[1] and oracle_k[0] / float(oracle_k[1]) >= args.min_coverage:
-        if not online_k[1]:
+        explanation = "too few eligible mutually exclusive stall triggers for a decision"
+    elif null_gate_applied and raw_template_ready and not calibrated_template_ready:
+        verdict = "STATE_SIGNAL_NULL_SATURATED"
+        explanation = "raw template-novel coverage does not survive the same-app null-p95 state threshold"
+    elif calibrated_template_ready:
+        if not online_null_template_k[1]:
             verdict = "PROMISING_BUT_ONLINE_ORDER_IS_UNKNOWN"
-            explanation = "the corpus contains reusable experience, but trajectory timestamps are missing"
-        elif online_k[0] / float(online_k[1]) >= args.min_coverage:
+            explanation = "the corpus contains null-calibrated template-novel experience, but trajectory timestamps are missing"
+        elif (
+            online_null_template_k[0] / float(online_null_template_k[1])
+            >= args.min_coverage
+        ):
             verdict = "READY_FOR_SMALL_ONLINE_ABLATION"
-            explanation = "state-compatible successful experience exists and is available online often enough"
+            explanation = "null-calibrated alternative action templates are available online often enough"
         else:
             verdict = "PROMISING_BUT_ONLINE_BANK_IS_COLD"
-            explanation = "the corpus contains reusable experience, but run order limits online availability"
+            explanation = "null-calibrated template-novel experience exists, but run order limits online availability"
+    elif oracle_k[1] and oracle_k[0] / float(oracle_k[1]) >= args.min_coverage:
+        verdict = "INSUFFICIENT_PROCEDURE_NOVELTY"
+        explanation = "compatible donors exist, but too few offer a different action template"
     else:
         verdict = "NOT_SUPPORTED_AT_CURRENT_RETRIEVAL_GRANULARITY"
-        explanation = "too few genuine stalls have a compatible cross-task successful transition"
+        explanation = "too few eligible stalls have a compatible cross-task successful transition"
     lines.extend([
         "## Decision Gate",
         "",
         "**{}**: {}.".format(verdict, explanation),
         "",
-        "Gate used here: at least {} eligible queries and oracle compatible@{} >= {:.0f}%.".format(
-            args.min_queries, args.top_k, 100 * args.min_coverage
+        "Gate used here: at least {} eligible queries and oracle novel-template@{} >= {:.0f}%, "
+        "using null-p95 state thresholds for apps with at least {} calibration pairs.".format(
+            args.min_queries, args.top_k, 100 * args.min_coverage,
+            args.min_null_pairs_for_gate,
         ),
         "",
     ])
@@ -1101,13 +1313,17 @@ def build_report(
     if not covered:
         lines.append("None.")
     else:
-        lines.append("| domain | task | goal | stall | step | support | online |")
-        lines.append("| --- | --- | --- | --- | ---: | ---: | ---: |")
+        lines.append("| domain | task | goal | stall type | trigger | step | support | novel template | null-p95 | online | online null-p95 |")
+        lines.append("| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
         for row in covered[:args.top]:
-            lines.append("| {} | {} | {} | {} | {} | {} | {} |".format(
+            lines.append("| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 _md(row["domain"]), _md(row["task_id"]), _md(row["goal_key"]),
-                _md(row["reason"]), row["step_num"], row["oracle_support"],
+                _md(row["stall_type"]), _md(row["trigger_rule"]),
+                row["step_num"], row["oracle_support"],
+                "yes" if row["oracle_template_covered_at_k"] else "no",
+                "yes" if row["oracle_null_calibrated_template_covered_at_k"] else "no",
                 "yes" if row["online_covered_at_k"] else "no",
+                "yes" if row["online_null_calibrated_template_covered_at_k"] else "no",
             ))
     lines.append("")
     return "\n".join(lines)
@@ -1125,8 +1341,14 @@ def main() -> None:
                         help="Skip result folders whose names start with fix_rewrite_.")
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--success-threshold", type=float, default=0.0)
-    parser.add_argument("--min-stall-run", type=int, default=3)
-    parser.add_argument("--no-progress-threshold", type=float, default=0.995)
+    parser.add_argument("--error-repeat-threshold", type=int, default=2,
+                        help="Consecutive identical normalized execution errors required for a loop.")
+    parser.add_argument("--exact-repeat-threshold", type=int, default=2,
+                        help="Consecutive identical action keys required for exact-repeat.")
+    parser.add_argument("--lowlevel-run-threshold", type=int, default=3,
+                        help="Consecutive lowlevel_select actions required for lowlevel-static.")
+    parser.add_argument("--no-progress-threshold", type=float, default=0.995,
+                        help="Static-screen evidence and donor state-change cutoff.")
     parser.add_argument("--candidate-state-threshold", type=float, default=0.90)
     parser.add_argument("--min-goal-similarity", type=float, default=0.50)
     parser.add_argument("--min-instruction-similarity", type=float, default=0.15)
@@ -1141,20 +1363,27 @@ def main() -> None:
     parser.add_argument("--thumbnail-width", type=int, default=32)
     parser.add_argument("--thumbnail-height", type=int, default=18)
     parser.add_argument("--null-pairs-per-app", type=int, default=500,
-                        help="Deterministic cross-task screenshot pairs sampled per app for report-only calibration.")
+                        help="Deterministic cross-task screenshot pairs sampled per app for calibration.")
+    parser.add_argument("--min-null-pairs-for-gate", type=int, default=20,
+                        help="Minimum same-app null pairs required before p95 affects the decision gate.")
     args = parser.parse_args()
 
     positive = {
-        "min_stall_run": args.min_stall_run,
+        "error_repeat_threshold": args.error_repeat_threshold,
+        "exact_repeat_threshold": args.exact_repeat_threshold,
+        "lowlevel_run_threshold": args.lowlevel_run_threshold,
         "context_length": args.context_length,
         "continuation_steps": args.continuation_steps,
         "top_k": args.top_k,
         "thumbnail_width": args.thumbnail_width,
         "thumbnail_height": args.thumbnail_height,
         "null_pairs_per_app": args.null_pairs_per_app,
+        "min_null_pairs_for_gate": args.min_null_pairs_for_gate,
     }
     for name, value in positive.items():
-        minimum = 2 if name == "min_stall_run" else 1
+        minimum = 2 if name in {
+            "error_repeat_threshold", "exact_repeat_threshold", "lowlevel_run_threshold"
+        } else 1
         if value < minimum:
             parser.error("--{} must be >= {}".format(name.replace("_", "-"), minimum))
     for name in (
@@ -1169,6 +1398,7 @@ def main() -> None:
     images = ImageFingerprinter(args.thumbnail_width, args.thumbnail_height)
     stalls, donors, query_rows, candidate_rows = analyze(episodes, images, args)
     state_null = build_state_similarity_null(stalls, donors, images, args)
+    apply_null_calibration(query_rows, candidate_rows, state_null, args)
     report = build_report(episodes, stalls, donors, query_rows, state_null, images, args)
     print(report)
 
@@ -1178,13 +1408,20 @@ def main() -> None:
         write_jsonl(os.path.join(args.out_dir, "retrieval_candidates.jsonl"), candidate_rows)
         fields = [
             "query_id", "episode_id", "run_id", "domain", "canonical_domain", "app", "task_id",
-            "goal_key", "step_num", "step_ordinal", "reason", "eligible", "exclusion_reason",
+            "goal_key", "step_num", "step_ordinal", "stall_type", "trigger_rule",
+            "state_evidence", "eligible", "exclusion_reason", "query_state_available",
             "stall_state_similarity", "stall_l1", "stall_l2", "stall_action_template",
             "stall_screenshot", "online_order_known", "oracle_candidate_count", "oracle_compatible_count",
             "oracle_covered_at_1", "oracle_covered_at_k", "oracle_covered_any", "oracle_support",
-            "oracle_agreement", "online_candidate_count", "online_compatible_count",
+            "oracle_template_covered_at_1", "oracle_template_covered_at_k",
+            "oracle_template_covered_any", "oracle_agreement",
+            "online_candidate_count", "online_compatible_count",
             "online_covered_at_1", "online_covered_at_k", "online_covered_any", "online_support",
-            "online_agreement",
+            "online_template_covered_at_1", "online_template_covered_at_k",
+            "online_template_covered_any", "online_agreement",
+            "null_calibration_pairs", "null_calibration_applied", "null_calibrated_threshold",
+            "oracle_null_calibrated_template_covered_at_k",
+            "online_null_calibrated_template_covered_at_k",
         ]
         write_tsv(os.path.join(args.out_dir, "stall_retrieval_summary.tsv"), fields, query_rows)
         with open(os.path.join(args.out_dir, "stall_retrieval_report.md"), "w", encoding="utf-8") as handle:
