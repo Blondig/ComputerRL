@@ -23,8 +23,8 @@ For every failed episode it:
                  (or across roots with --online-scope all) are available.
 
 Low-level typing is intentionally outside the no-progress rule because thumbnail
-similarity can miss productive text edits. Exact repeats may trigger with unknown
-state evidence; low-level select runs require positive static-screen evidence.
+similarity can miss productive text edits. Exact repeats and low-level select
+runs both require complete positive static-screen evidence.
 
 Pillow (already declared by ComputerRL) is used for fast screenshot decoding. A
 small deterministic stdlib PNG fallback keeps the probe usable in bare shells.
@@ -32,6 +32,7 @@ small deterministic stdlib PNG fallback keeps the probe usable in bare shells.
 Usage:
   python analyze_stall_retrieval_probe.py \
     --run-root /path/to/computerrl_omni_rec2 \
+    --precision-audit \
     --out-dir /path/to/stall_retrieval_probe
 
 Outputs:
@@ -39,6 +40,9 @@ Outputs:
   retrieval_candidates.jsonl
   stall_retrieval_summary.tsv
   stall_retrieval_report.md
+  stall_precision_windows.jsonl       (--precision-audit)
+  stall_precision_summary.tsv         (--precision-audit)
+  stall_precision_report.md           (--precision-audit)
 """
 
 import argparse
@@ -620,18 +624,37 @@ def _window_state_similarity(
     window: Sequence[TraceStep],
     images: ImageFingerprinter,
 ) -> Optional[float]:
-    sims = [
+    sims = _adjacent_state_similarities(window, images)
+    if not sims or any(sim is None for sim in sims):
+        return None
+    return min(sim for sim in sims if sim is not None)
+
+
+def _adjacent_state_similarities(
+    window: Sequence[TraceStep],
+    images: ImageFingerprinter,
+) -> List[Optional[float]]:
+    return [
         images.similarity(window[i - 1].screenshot_path, window[i].screenshot_path)
         for i in range(1, len(window))
     ]
-    if not sims or any(sim is None for sim in sims):
-        return None
-    return min(sims)
 
 
-def detect_first_stall(episode: Episode, images: ImageFingerprinter, args) -> Optional[StallEvent]:
-    if episode.success is not False:
+def detect_first_stall(
+    episode: Episode,
+    images: ImageFingerprinter,
+    args,
+    *,
+    failed_only: bool = True,
+    no_progress_threshold: Optional[float] = None,
+) -> Optional[StallEvent]:
+    if failed_only and episode.success is not False:
         return None
+    state_threshold = (
+        args.no_progress_threshold
+        if no_progress_threshold is None
+        else no_progress_threshold
+    )
     for end in range(len(episode.steps)):
         match: Optional[Tuple[int, str, str, Optional[float], str]] = None
 
@@ -654,13 +677,12 @@ def detect_first_stall(episode: Episode, images: ImageFingerprinter, args) -> Op
                 if keys[0] and len(set(keys)) == 1:
                     state_similarity = _window_state_similarity(window, images)
                     if (
-                        state_similarity is None
-                        or state_similarity >= args.no_progress_threshold
+                        state_similarity is not None
+                        and state_similarity >= state_threshold
                     ):
-                        state_evidence = "unknown" if state_similarity is None else "static"
                         match = (
                             start, "no_progress", "exact_repeat",
-                            state_similarity, state_evidence,
+                            state_similarity, "static",
                         )
 
         if match is None and end + 1 >= args.lowlevel_run_threshold:
@@ -676,7 +698,7 @@ def detect_first_stall(episode: Episode, images: ImageFingerprinter, args) -> Op
                     state_similarity = _window_state_similarity(window, images)
                     if (
                         state_similarity is not None
-                        and state_similarity >= args.no_progress_threshold
+                        and state_similarity >= state_threshold
                     ):
                         match = (
                             start, "no_progress", "lowlevel_static",
@@ -714,6 +736,225 @@ def detect_first_stall(episode: Episode, images: ImageFingerprinter, args) -> Op
             exclusion_reason=exclusion,
         )
     return None
+
+
+def _episode_outcome(episode: Episode) -> str:
+    if episode.success is True:
+        return "pass"
+    if episode.success is False:
+        return "fail"
+    return "unknown"
+
+
+def _audit_step(step: Optional[TraceStep]) -> Optional[dict]:
+    if step is None:
+        return None
+    return {
+        "ordinal": step.ordinal,
+        "step_num": step.step_num,
+        "action": _compact(step.action, 1000),
+        "action_key": step.action_key,
+        "action_template": step.action_template,
+        "l1": step.l1,
+        "l2": step.l2,
+        "error_class": step.error_class,
+        "error_template": step.error_template,
+        "exe_result": _compact(step.exe_result, 1000),
+        "response": _compact(step.response, 1000),
+        "screenshot": step.screenshot_path,
+    }
+
+
+def _precision_window_row(
+    event: StallEvent,
+    images: ImageFingerprinter,
+    threshold: float,
+) -> dict:
+    episode = event.episode
+    window = episode.steps[event.window_start:event.step_pos + 1]
+    adjacent = _adjacent_state_similarities(window, images)
+    before = episode.steps[event.window_start - 1] if event.window_start > 0 else None
+    after = episode.steps[event.step_pos + 1] if event.step_pos + 1 < len(episode.steps) else None
+    pre_similarity = (
+        images.similarity(before.screenshot_path, window[0].screenshot_path)
+        if before is not None and window else None
+    )
+    next_similarity = (
+        images.similarity(window[-1].screenshot_path, after.screenshot_path)
+        if after is not None and window else None
+    )
+
+    def rounded(value: Optional[float]) -> Optional[float]:
+        return None if value is None else round(value, 6)
+
+    return {
+        "review_id": event.query_id,
+        "threshold": round(threshold, 6),
+        "outcome": _episode_outcome(episode),
+        "score": episode.score,
+        "episode_id": episode.episode_id,
+        "run_id": episode.root_id,
+        "domain": episode.domain,
+        "canonical_domain": episode.canonical_domain,
+        "app": episode.task.app,
+        "task_id": episode.task_id,
+        "goal_key": episode.task.goal_key,
+        "instruction": _compact(episode.task.instruction, 1200),
+        "stall_type": event.stall_type or "routed_out",
+        "trigger_rule": event.trigger_rule,
+        "eligible": int(event.eligible),
+        "exclusion_reason": event.exclusion_reason,
+        "state_evidence": event.state_evidence,
+        "window_start_ordinal": event.window_start,
+        "window_end_ordinal": event.step_pos,
+        "window_start_step_num": window[0].step_num if window else None,
+        "window_end_step_num": window[-1].step_num if window else None,
+        "window_min_state_similarity": rounded(event.state_similarity),
+        "adjacent_state_similarities": [rounded(value) for value in adjacent],
+        "pre_window_step": _audit_step(before),
+        "pre_to_window_similarity": rounded(pre_similarity),
+        "window_steps": [_audit_step(step) for step in window],
+        "next_step": _audit_step(after),
+        "window_to_next_similarity": rounded(next_similarity),
+        "manual_label": "",
+        "manual_notes": "",
+    }
+
+
+def _precision_thresholds(args) -> List[float]:
+    configured = list(getattr(args, "precision_threshold", []) or [])
+    if not configured:
+        configured = [0.993, 0.997]
+    configured.append(args.no_progress_threshold)
+    return sorted({round(value, 6) for value in configured})
+
+
+def build_precision_audit(
+    episodes: Sequence[Episode],
+    images: ImageFingerprinter,
+    args,
+) -> Tuple[List[dict], List[dict]]:
+    thresholds = _precision_thresholds(args)
+    current_threshold = round(args.no_progress_threshold, 6)
+    events_by_threshold: Dict[float, List[StallEvent]] = {}
+    summary_rows: List[dict] = []
+
+    for threshold in thresholds:
+        events = [
+            event
+            for episode in episodes
+            if (
+                event := detect_first_stall(
+                    episode,
+                    images,
+                    args,
+                    failed_only=False,
+                    no_progress_threshold=threshold,
+                )
+            )
+        ]
+        events_by_threshold[threshold] = events
+        for outcome in ("pass", "fail", "unknown"):
+            outcome_episodes = [
+                episode for episode in episodes if _episode_outcome(episode) == outcome
+            ]
+            if not outcome_episodes:
+                continue
+            rows = [event for event in events if _episode_outcome(event.episode) == outcome]
+            eligible = [event for event in rows if event.eligible]
+            summary_rows.append({
+                "threshold": threshold,
+                "outcome": outcome,
+                "episodes": len(outcome_episodes),
+                "detected": len(rows),
+                "eligible": len(eligible),
+                "excluded": len(rows) - len(eligible),
+                "detected_rate": round(len(rows) / float(len(outcome_episodes)), 6),
+                "eligible_rate": round(len(eligible) / float(len(outcome_episodes)), 6),
+                "exact_repeat": sum(event.trigger_rule == "exact_repeat" for event in rows),
+                "lowlevel_static": sum(event.trigger_rule == "lowlevel_static" for event in rows),
+                "error_repeat": sum(event.trigger_rule == "error_repeat" for event in rows),
+                "static": sum(event.state_evidence == "static" for event in eligible),
+                "unknown_state": sum(event.state_evidence == "unknown" for event in eligible),
+            })
+
+    current_events = events_by_threshold.get(current_threshold, [])
+    window_rows = [
+        _precision_window_row(event, images, current_threshold)
+        for event in current_events
+    ]
+    window_rows.sort(key=lambda row: (
+        {"fail": 0, "pass": 1, "unknown": 2}.get(row["outcome"], 3),
+        row["domain"],
+        row["task_id"],
+        row["window_end_ordinal"],
+    ))
+    return window_rows, summary_rows
+
+
+def build_precision_report(
+    window_rows: Sequence[dict],
+    summary_rows: Sequence[dict],
+    args,
+    heading_level: int = 1,
+) -> str:
+    heading = "#" * heading_level
+    current_threshold = round(args.no_progress_threshold, 6)
+    lines = [
+        "{} Stall Precision Audit".format(heading),
+        "",
+        "This is a label-ready trigger audit, not an automatic precision estimate. "
+        "A passing episode may transiently stall and recover, so pass hits are controls that still require window review.",
+        "Exact-repeat and lowlevel-static both require complete static screenshot evidence; missing state does not trigger either rule.",
+        "The threshold sweep changes only screenshot-backed no-progress rules; error-repeat counts are expected to stay fixed.",
+        "",
+        "| threshold | outcome | episodes | detected | eligible | exact repeat | lowlevel static | error repeat | excluded |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in summary_rows:
+        lines.append(
+            "| {:.4f} | {} | {} | {}/{} ({}) | {}/{} ({}) | {} | {} | {} | {} |".format(
+                row["threshold"], row["outcome"], row["episodes"],
+                row["detected"], row["episodes"], _pct(row["detected"], row["episodes"]),
+                row["eligible"], row["episodes"], _pct(row["eligible"], row["episodes"]),
+                row["exact_repeat"], row["lowlevel_static"], row["error_repeat"],
+                row["excluded"],
+            )
+        )
+
+    lines.extend([
+        "",
+        "{}# Active-Threshold Review Queue".format(heading),
+        "",
+        "- threshold: {:.4f}".format(current_threshold),
+        "- windows: {}".format(len(window_rows)),
+        "- labels to fill in `stall_precision_windows.jsonl`: `true_stall`, `productive_repeat`, or `uncertain`",
+        "- treat `uncertain` as non-trigger when estimating an online precision-first policy",
+        "",
+        "| outcome | trigger | detected | eligible | static | unknown | exclusions |",
+        "| --- | --- | ---: | ---: | ---: | ---: | --- |",
+    ])
+    grouped: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
+    for row in window_rows:
+        grouped[(row["outcome"], row["trigger_rule"])].append(row)
+    if not grouped:
+        lines.append("| - | - | 0 | 0 | 0 | 0 | - |")
+    for (outcome, trigger), rows in sorted(grouped.items()):
+        exclusions = Counter(row["exclusion_reason"] or "none" for row in rows if not row["eligible"])
+        exclusion_text = ", ".join(
+            "{}={}".format(key, value) for key, value in exclusions.most_common()
+        ) or "-"
+        lines.append("| {} | {} | {} | {} | {} | {} | {} |".format(
+            outcome,
+            trigger,
+            len(rows),
+            sum(row["eligible"] for row in rows),
+            sum(row["state_evidence"] == "static" for row in rows),
+            sum(row["state_evidence"] == "unknown" for row in rows),
+            exclusion_text,
+        ))
+    lines.append("")
+    return "\n".join(lines)
 
 
 def build_donors(episodes: Sequence[Episode], images: ImageFingerprinter, args) -> List[DonorTransition]:
@@ -1117,7 +1358,7 @@ def build_report(
         "- execution-error repeat: {} consecutive identical normalized errors".format(
             args.error_repeat_threshold
         ),
-        "- exact repeat: {} error-free identical action keys; visible change vetoes the trigger, missing state is allowed".format(
+        "- exact repeat: {} error-free identical action keys with complete static evidence".format(
             args.exact_repeat_threshold
         ),
         "- low-level no progress: {} error-free lowlevel_select actions with at least two distinct keys and complete static evidence".format(
@@ -1340,6 +1581,18 @@ def main() -> None:
     parser.add_argument("--exclude-rewrite", action="store_true",
                         help="Skip result folders whose names start with fix_rewrite_.")
     parser.add_argument("--out-dir", default="")
+    parser.add_argument(
+        "--precision-audit",
+        action="store_true",
+        help="Audit the same first-stall detector on pass/fail episodes without adding pass queries to retrieval.",
+    )
+    parser.add_argument(
+        "--precision-threshold",
+        action="append",
+        type=float,
+        default=[],
+        help="Static-screen threshold for precision sensitivity; repeatable and implies --precision-audit.",
+    )
     parser.add_argument("--success-threshold", type=float, default=0.0)
     parser.add_argument("--error-repeat-threshold", type=int, default=2,
                         help="Consecutive identical normalized execution errors required for a loop.")
@@ -1393,6 +1646,11 @@ def main() -> None:
         value = getattr(args, name)
         if not 0.0 <= value <= 1.0:
             parser.error("--{} must be in [0, 1]".format(name.replace("_", "-")))
+    for value in args.precision_threshold:
+        if not 0.0 <= value <= 1.0:
+            parser.error("--precision-threshold must be in [0, 1]")
+    if args.precision_threshold:
+        args.precision_audit = True
 
     episodes = discover_episodes(args)
     images = ImageFingerprinter(args.thumbnail_width, args.thumbnail_height)
@@ -1400,6 +1658,17 @@ def main() -> None:
     state_null = build_state_similarity_null(stalls, donors, images, args)
     apply_null_calibration(query_rows, candidate_rows, state_null, args)
     report = build_report(episodes, stalls, donors, query_rows, state_null, images, args)
+    precision_windows: List[dict] = []
+    precision_summary: List[dict] = []
+    precision_report = ""
+    if args.precision_audit:
+        precision_windows, precision_summary = build_precision_audit(episodes, images, args)
+        precision_report = build_precision_report(
+            precision_windows, precision_summary, args, heading_level=1
+        )
+        report = report.rstrip() + "\n\n" + build_precision_report(
+            precision_windows, precision_summary, args, heading_level=2
+        )
     print(report)
 
     if args.out_dir:
@@ -1426,6 +1695,27 @@ def main() -> None:
         write_tsv(os.path.join(args.out_dir, "stall_retrieval_summary.tsv"), fields, query_rows)
         with open(os.path.join(args.out_dir, "stall_retrieval_report.md"), "w", encoding="utf-8") as handle:
             handle.write(report)
+        if args.precision_audit:
+            write_jsonl(
+                os.path.join(args.out_dir, "stall_precision_windows.jsonl"),
+                precision_windows,
+            )
+            precision_fields = [
+                "threshold", "outcome", "episodes", "detected", "eligible", "excluded",
+                "detected_rate", "eligible_rate", "exact_repeat", "lowlevel_static",
+                "error_repeat", "static", "unknown_state",
+            ]
+            write_tsv(
+                os.path.join(args.out_dir, "stall_precision_summary.tsv"),
+                precision_fields,
+                precision_summary,
+            )
+            with open(
+                os.path.join(args.out_dir, "stall_precision_report.md"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(precision_report)
         print("\nwrote", args.out_dir)
 
 
