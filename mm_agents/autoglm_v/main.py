@@ -11,6 +11,7 @@ from .prompt.accessibility_tree_handle import linearize_accessibility_tree, trim
 from .prompt.grounding_agent import GroundingAgent as Agent
 from .tools.package.google_chrome import BrowserTools
 from .prompt.procedural_memory import Prompt
+from ..stall_recovery import HintBank, StallDetector, format_stall_intervention
 
 logger = logging.getLogger("desktopenv.agent")
 
@@ -91,6 +92,8 @@ class AutoGLMAgent:
         omni_top_k: int = 5,
         error_ledger=None,
         use_recovery: bool = False,
+        stall_recovery: str = "off",
+        stall_hint_bank: str = None,
     ):
         self.action_space = action_space
         self.observation_type = observation_type
@@ -128,13 +131,26 @@ class AutoGLMAgent:
         # Intra-task action-interface repair -- independent of Omni / ledger / parser.
         self.use_recovery = use_recovery
 
+        # Stall-triggered retrieval-augmented recovery -- independent of use_recovery
+        # (the frozen interface-repair arm) and of the ledger. off | replan | hint.
+        # It only ever ADDS a text block to the next user turn; with "off" the
+        # prompt stays byte-identical to baseline.
+        self.stall_recovery = stall_recovery if stall_recovery in ("off", "replan", "hint") else "off"
+        self._stall_detector = StallDetector() if self.stall_recovery != "off" else None
+        self._stall_bank = None
+        if self.stall_recovery == "hint" and stall_hint_bank:
+            try:
+                self._stall_bank = HintBank(stall_hint_bank)
+            except Exception as e:
+                logger.warning("StallRecovery: hint bank unavailable (%s); running as replan arm", e)
+
         self.contents = []
 
     @property
     def turn_number(self):
         return len(self.contents)
 
-    def prepare(self, instruction: str, obs: Dict, history: List, last_result: str = "", repair: bool = False) -> List:
+    def prepare(self, instruction: str, obs: Dict, history: List, last_result: str = "", repair: bool = False, stall_context: str = "") -> List:
         """
         Predict the next action(s) based on the current observation.
         """
@@ -217,6 +233,11 @@ class AutoGLMAgent:
         # state-dependent memo (v2) rides in the user turn, not the system prompt
         if mem_context and mem_target == "user":
             prompt += "\n\n" + mem_context
+
+        # stall-recovery intervention also rides in the user turn (never the
+        # system prompt, never the repair contract below).
+        if stall_context:
+            prompt += "\n\n" + stall_context
 
         # action-interface repair (L2): on a same-step regeneration, append a hard
         # output contract. The caller passes only a short recent history window so the
@@ -473,9 +494,55 @@ class AutoGLMAgent:
         logger.info(f"Omni retrieved indices={result_indices} from {self.turn_number} turns")
         return result_indices
 
+    def _stall_update(self, obs: Dict) -> str:
+        """Feed the stall detector with the PREVIOUS action's outcome (the current
+        obs carries its exe_result and the post-action screenshot) and return the
+        intervention block for THIS turn when a stall fires. Best-effort like the
+        repair arm: any failure degrades to no intervention, never to a crash."""
+        try:
+            if not self.contents:
+                return ""
+            prev = self.contents[-1]
+            signal = self._stall_detector.update(
+                executed_action=prev.get("action"),
+                exe_result=str(obs.get("exe_result", "") or ""),
+                screenshot=obs.get("screenshot"),
+            )
+            if signal is None:
+                return ""
+            # The hint rides only on the FIRST fire of a task: if the agent is
+            # still stuck after a hinted replan, later fires drop the hint so a
+            # bad reference cannot keep anchoring the re-plan (v31 lesson).
+            hint = None
+            if self._stall_bank is not None and signal["fire_index"] == 1:
+                recent = [str(c.get("response", "")) for c in self.contents[-4:]]
+                hint = self._stall_bank.retrieve(
+                    app=obs.get("cur_app") or "",
+                    instruction=str(prev.get("instruction", "")),
+                    recent_responses=recent,
+                    screenshot=obs.get("screenshot"),
+                )
+            logger.info("StallRecovery: %s", {
+                "rule": signal["rule"],
+                "fire_index": signal["fire_index"],
+                "step_index": signal["step_index"],
+                "state_similarity": round(signal["state_similarity"], 6),
+                "mode": self.stall_recovery,
+                "hint": None if hint is None else {
+                    "donor_task": hint.get("task_id"),
+                    "donor_domain": hint.get("domain"),
+                    "score": hint.get("score"),
+                },
+            })
+            return format_stall_intervention(signal, hint)
+        except Exception as e:
+            logger.warning("StallRecovery aborted (%s); continuing without intervention", e)
+            return ""
+
     def predict(self, instruction: str, obs: Dict) -> List:
+        stall_context = self._stall_update(obs) if self._stall_detector is not None else ""
         history = self.format_history(obs.get("exe_result", ""))
-        messages = self.prepare(instruction, obs, history)
+        messages = self.prepare(instruction, obs, history, stall_context=stall_context)
 
         response = self._gen(messages)
         logger.info("RESPONSE: %s", response)
@@ -565,6 +632,8 @@ class AutoGLMAgent:
 
         self.contents = []
         self._init_omni()
+        if self._stall_detector is not None:
+            self._stall_detector.reset()
 
     def _init_omni(self):
         if not self._omni_data_dir:

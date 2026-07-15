@@ -138,6 +138,13 @@ def config() -> argparse.Namespace:
     parser.add_argument("--ledger_disable_success_snippets", action="store_true",
                         help="v3 only (v35 risk-only ablation): still RECORD success snippets but "
                              "never retrieve/inject NEXT notes, isolating whether surfacing NEXT contributes.")
+    parser.add_argument("--stall_recovery", type=str, default="off", choices=["off", "replan", "hint"],
+                        help="Stall-triggered recovery, independent of --recovery: replan=deterministic "
+                             "break-loop nudge on a detected stall (Arm A); hint=nudge plus a retrieved "
+                             "cross-task reference card for the replanner (Arm B).")
+    parser.add_argument("--stall_hint_bank", type=str, default=None,
+                        help="Hint-bank jsonl built by build_stall_hint_bank.py; used only with "
+                             "--stall_recovery hint (missing bank degrades to the replan arm).")
 
     args = parser.parse_args()
 
@@ -474,7 +481,12 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         omni_llm_model=args.omni_llm_model,
         error_ledger=ledger,
         use_recovery=args.recovery,
+        stall_recovery=args.stall_recovery,
+        stall_hint_bank=args.stall_hint_bank,
     )
+    if args.stall_recovery != "off":
+        logger.info(f"StallRecovery enabled: mode={args.stall_recovery}"
+                    + (f" bank={args.stall_hint_bank}" if args.stall_hint_bank else " (no bank)"))
 
     for domain in tqdm(test_all_meta, desc="Domain"):
         for example_id in tqdm(test_all_meta[domain], desc="Example", leave=False):

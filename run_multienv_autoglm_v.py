@@ -77,6 +77,11 @@ def config() -> argparse.Namespace:
 
     # logging related
     parser.add_argument("--result_dir", type=str, default="./results")
+    parser.add_argument("--stall_recovery", type=str, default="off", choices=["off", "replan", "hint"],
+                        help="Stall-triggered recovery: replan=break-loop nudge (Arm A); "
+                             "hint=nudge + retrieved cross-task reference (Arm B).")
+    parser.add_argument("--stall_hint_bank", type=str, default=None,
+                        help="Hint-bank jsonl built by build_stall_hint_bank.py (Arm B only).")
     
     # parallel number
     parser.add_argument("--num_workers", type=int, default=1, help="Number of parallel workers")
@@ -149,6 +154,8 @@ def _worker_run(task):
             max_trajectory_length=args.max_trajectory_length,
             client_password=args.client_password,
             gen_func=call_llm,
+            stall_recovery=args.stall_recovery,
+            stall_hint_bank=args.stall_hint_bank,
         )
 
         example_result_dir = os.path.join(
