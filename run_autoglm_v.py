@@ -138,10 +138,11 @@ def config() -> argparse.Namespace:
     parser.add_argument("--ledger_disable_success_snippets", action="store_true",
                         help="v3 only (v35 risk-only ablation): still RECORD success snippets but "
                              "never retrieve/inject NEXT notes, isolating whether surfacing NEXT contributes.")
-    parser.add_argument("--stall_recovery", type=str, default="off", choices=["off", "replan", "hint"],
+    parser.add_argument("--stall_recovery", type=str, default="off", choices=["off", "replan", "hint", "forbid"],
                         help="Stall-triggered recovery, independent of --recovery: replan=deterministic "
                              "break-loop nudge on a detected stall (Arm A); hint=nudge plus a retrieved "
-                             "cross-task reference card for the replanner (Arm B).")
+                             "cross-task reference card (Arm B); forbid=nudge plus a state-local hard "
+                             "ban on the exact repeated action with one regeneration (Arm C).")
     parser.add_argument("--stall_hint_bank", type=str, default=None,
                         help="Hint-bank jsonl built by build_stall_hint_bank.py; used only with "
                              "--stall_recovery hint (missing bank degrades to the replan arm).")

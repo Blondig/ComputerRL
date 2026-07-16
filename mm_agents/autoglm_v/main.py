@@ -11,7 +11,17 @@ from .prompt.accessibility_tree_handle import linearize_accessibility_tree, trim
 from .prompt.grounding_agent import GroundingAgent as Agent
 from .tools.package.google_chrome import BrowserTools
 from .prompt.procedural_memory import Prompt
-from ..stall_recovery import HintBank, StallDetector, format_stall_intervention
+from ..stall_recovery import (
+    HintBank,
+    StallDetector,
+    _executed_action_key,
+    _strip_mangle_noise,
+    call_dumps,
+    format_stall_intervention,
+    pseudo_action,
+    screenshot_thumbnail,
+    thumb_similarity,
+)
 
 logger = logging.getLogger("desktopenv.agent")
 
@@ -132,11 +142,14 @@ class AutoGLMAgent:
         self.use_recovery = use_recovery
 
         # Stall-triggered retrieval-augmented recovery -- independent of use_recovery
-        # (the frozen interface-repair arm) and of the ledger. off | replan | hint.
-        # It only ever ADDS a text block to the next user turn; with "off" the
-        # prompt stays byte-identical to baseline.
-        self.stall_recovery = stall_recovery if stall_recovery in ("off", "replan", "hint") else "off"
+        # (the frozen interface-repair arm) and of the ledger.
+        # off | replan | hint | forbid. With "off" the prompt stays byte-identical
+        # to baseline.
+        self.stall_recovery = stall_recovery if stall_recovery in ("off", "replan", "hint", "forbid") else "off"
         self._stall_detector = StallDetector() if self.stall_recovery != "off" else None
+        # Forbid arm: the exact repeated action is blocked only while the screen
+        # remains equivalent to the state where the stall was detected.
+        self._stall_forbidden = None
         self._stall_bank = None
         if self.stall_recovery == "hint" and stall_hint_bank:
             try:
@@ -494,6 +507,22 @@ class AutoGLMAgent:
         logger.info(f"Omni retrieved indices={result_indices} from {self.turn_number} turns")
         return result_indices
 
+    def _refresh_stall_forbidden(self, obs: Dict) -> None:
+        """Keep the exact-action ban local to the screen that produced it."""
+        if self._stall_forbidden is None:
+            return
+        current_thumb = screenshot_thumbnail(obs.get("screenshot"))
+        similarity = thumb_similarity(
+            self._stall_forbidden.get("state_thumb"), current_thumb
+        )
+        threshold = self._stall_detector.state_threshold
+        if similarity is None or similarity < threshold:
+            logger.info("StallContractCleared: %s", {
+                "reason": "missing_state" if similarity is None else "state_changed",
+                "state_similarity": None if similarity is None else round(similarity, 6),
+            })
+            self._stall_forbidden = None
+
     def _stall_update(self, obs: Dict) -> str:
         """Feed the stall detector with the PREVIOUS action's outcome (the current
         obs carries its exe_result and the post-action screenshot) and return the
@@ -528,19 +557,44 @@ class AutoGLMAgent:
                 "step_index": signal["step_index"],
                 "state_similarity": round(signal["state_similarity"], 6),
                 "mode": self.stall_recovery,
+                "stalled": signal.get("stalled_action", ""),
                 "hint": None if hint is None else {
                     "donor_task": hint.get("task_id"),
                     "donor_domain": hint.get("domain"),
                     "score": hint.get("score"),
                 },
             })
-            return format_stall_intervention(signal, hint)
+            forbid = self.stall_recovery == "forbid"
+            # The contract must name the action in the MODEL's own submitted form
+            # (e.g. Agent.click([100, 200])), not the grounded pyautogui command the
+            # detector keys on -- the model has never seen the grounded string.
+            submitted = _strip_mangle_noise(pseudo_action(str(prev.get("response", ""))))
+            if submitted:
+                signal["stalled_action"] = " ".join(submitted.split())[:120]
+            text = format_stall_intervention(signal, hint, forbid=forbid)
+            if forbid and signal.get("stalled_key"):
+                self._stall_forbidden = {
+                    "key": signal["stalled_key"],
+                    "action": signal.get("stalled_action", ""),
+                    "context": text,
+                    "state_thumb": screenshot_thumbnail(obs.get("screenshot")),
+                }
+            return text
         except Exception as e:
             logger.warning("StallRecovery aborted (%s); continuing without intervention", e)
             return ""
 
     def predict(self, instruction: str, obs: Dict) -> List:
-        stall_context = self._stall_update(obs) if self._stall_detector is not None else ""
+        if self._stall_detector is not None:
+            self._refresh_stall_forbidden(obs)
+            active_context = (
+                self._stall_forbidden.get("context", "")
+                if self._stall_forbidden is not None else ""
+            )
+            fresh_context = self._stall_update(obs)
+            stall_context = fresh_context or active_context
+        else:
+            stall_context = ""
         history = self.format_history(obs.get("exe_result", ""))
         messages = self.prepare(instruction, obs, history, stall_context=stall_context)
 
@@ -597,6 +651,77 @@ class AutoGLMAgent:
                                               "repair_level": repair_level,
                                               "attempts": attempt})
 
+        # State-local stall contract (forbid arm only). The same model proposes one
+        # action; code rejects the exact stalled action and permits one regeneration.
+        # If no different executable candidate is produced, dispatch nothing rather
+        # than knowingly execute the blocked action again.
+        if self._stall_forbidden is not None:
+            forbidden = self._stall_forbidden
+            violated = False
+            try:
+                forbidden_dumps = call_dumps(forbidden.get("action", ""))
+
+                def _violates(resp_obj, acts):
+                    # Check both the grounded command and exact submitted statements:
+                    # a response cannot evade the ban by appending another call.
+                    if any(
+                        _executed_action_key(action) == forbidden["key"]
+                        for action in (acts or [])
+                    ):
+                        return True
+                    submitted_text = pseudo_action(self._response_text(resp_obj))
+                    submitted_dumps = call_dumps(submitted_text)
+                    if forbidden_dumps and submitted_dumps:
+                        return bool(forbidden_dumps & submitted_dumps)
+                    return bool(
+                        submitted_text
+                        and _executed_action_key(submitted_text)
+                        == _executed_action_key(forbidden.get("action", ""))
+                    )
+
+                def _candidate_exec_ok(candidate_actions, candidate_ok):
+                    if not candidate_actions or not candidate_ok:
+                        return False
+                    if isinstance(candidate_actions[0], str):
+                        compile_ok, _ = self._interface_check(candidate_actions[0])
+                        return compile_ok
+                    return True
+
+                violated = _violates(response, actions)
+                accepted = None
+                rejected = False
+                if violated:
+                    harder = forbidden["context"] + (
+                        "\n\n* The proposed action was rejected because it exactly "
+                        "matched the blocked action. Return ONE different executable "
+                        "action now; the blocked action will not be executed."
+                    )
+                    retry_msgs = self.prepare(instruction, obs, history, stall_context=harder)
+                    retry_response = self._gen(retry_msgs)
+                    logger.info("RESPONSE(stall-forbid): %s", retry_response)
+                    retry_actions, retry_ok, retry_fp = self.execute(retry_response, obs)
+                    accepted = bool(
+                        _candidate_exec_ok(retry_actions, retry_ok)
+                        and not _violates(retry_response, retry_actions)
+                    )
+                    if accepted:
+                        response, actions = retry_response, retry_actions
+                        interface_ok, fingerprint = retry_ok, retry_fp
+                    else:
+                        response, actions = retry_response, []
+                        interface_ok, fingerprint = False, "stall_forbidden_rejected"
+                        rejected = True
+                logger.info("StallContract: %s", {
+                    "violated": violated,
+                    "regen_attempted": violated,
+                    "regen_accepted": accepted,
+                    "rejected": rejected,
+                })
+            except Exception as e:
+                logger.warning("StallContract aborted (%s); rejecting unverified action", e)
+                actions = []
+                interface_ok, fingerprint = False, "stall_forbidden_verifier_error"
+
         # contents / Omni / traj.jsonl are text channels, but gen_func may return
         # list/dict content blocks (a dict would crash response[:800] below, a list
         # would nest into the next turn's text field via format_history). Textify
@@ -631,6 +756,7 @@ class AutoGLMAgent:
         logger = _logger if _logger is not None else logging.getLogger("desktopenv.aguvis_agent")
 
         self.contents = []
+        self._stall_forbidden = None
         self._init_omni()
         if self._stall_detector is not None:
             self._stall_detector.reset()

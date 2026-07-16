@@ -77,9 +77,10 @@ def config() -> argparse.Namespace:
 
     # logging related
     parser.add_argument("--result_dir", type=str, default="./results")
-    parser.add_argument("--stall_recovery", type=str, default="off", choices=["off", "replan", "hint"],
+    parser.add_argument("--stall_recovery", type=str, default="off", choices=["off", "replan", "hint", "forbid"],
                         help="Stall-triggered recovery: replan=break-loop nudge (Arm A); "
-                             "hint=nudge + retrieved cross-task reference (Arm B).")
+                             "hint=nudge + retrieved cross-task reference (Arm B); "
+                             "forbid=state-local exact-action ban + one regeneration (Arm C).")
     parser.add_argument("--stall_hint_bank", type=str, default=None,
                         help="Hint-bank jsonl built by build_stall_hint_bank.py (Arm B only).")
     

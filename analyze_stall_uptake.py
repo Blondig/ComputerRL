@@ -11,9 +11,9 @@ the sibling traj.jsonl:
 
 This splits "replan rescued 0/N" into two different diseases:
   - mostly unchanged      -> the model ignores advice; a hard output CONTRACT
-                             (two-plan / forbidden-key regen) is the right lever.
+                             (state-local forbidden-key regen) is the right lever.
   - mostly changed+failed -> the model complies but lacks information/ability;
-                             skip two-plan, go to donor hints / stronger planner.
+                             skip the contract, go to donor hints / stronger planner.
 
 Usage (on the machine that has the result root):
   python analyze_stall_uptake.py \
@@ -30,7 +30,7 @@ import glob
 import json
 import os
 
-from mm_agents.stall_recovery import action_key, pseudo_action
+from mm_agents.stall_recovery import _executed_action_key, pseudo_action
 
 RELAPSE_WINDOW = 6
 
@@ -56,7 +56,13 @@ def parse_fires(runtime_path):
 
 
 def load_actions(traj_path):
-    """step_num -> submitted (pseudo) action key + display text."""
+    """step_num -> EXECUTED action key + display text.
+
+    Prefer traj's `action` (what actually ran, post-L1/L2 repair) over the raw
+    response: after a repair the two differ, and keying on the response would
+    misattribute behavior change. `_executed_action_key` is the SAME key the
+    online detector and the forbid hard ban use (mangle-normalized), so this
+    audit and the runtime can never disagree about what counts as 'changed'."""
     actions = {}
     try:
         handle = open(traj_path, encoding="utf-8", errors="replace")
@@ -73,9 +79,9 @@ def load_actions(traj_path):
             step = raw.get("step_num") or raw.get("step_idx")
             if not step:
                 continue
-            act = pseudo_action(str(raw.get("response") or "")) or str(raw.get("action") or "")
+            act = raw.get("action") or pseudo_action(str(raw.get("response") or ""))
             actions[int(step)] = {
-                "key": action_key(act),
+                "key": _executed_action_key(act),
                 "text": " ".join(str(act).split())[:70],
             }
     return actions
@@ -161,7 +167,7 @@ def main():
     print("  second fires that are the SAME loop returning: {}/{}".format(len(same_loop), len(second)))
     print()
     print("  reading: LOW changed  -> advice is ignored; a hard contract (forbid the")
-    print("           stalled key + regenerate) is the right next lever (two-plan).")
+    print("           stalled key + regenerate once) is the right next lever.")
     print("           HIGH changed but relapsed/failed -> compliance is not the problem;")
     print("           the model lacks information/ability -> donor hints / stronger planner.")
 

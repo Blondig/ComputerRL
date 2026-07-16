@@ -1,6 +1,6 @@
 """Stall-triggered retrieval-augmented recovery (--stall_recovery).
 
-Two arms over the SAME minimal detector (exact-repeat was selected by the
+Three arms over the SAME minimal detector (exact-repeat was selected by the
 offline precision audit in analyze_stall_retrieval_probe.py):
 
   replan (Arm A): on a detected stall, append a deterministic break-loop nudge
@@ -8,12 +8,15 @@ offline precision audit in analyze_stall_retrieval_probe.py):
   hint   (Arm B): Arm A + retrieve a similar successful transition from a
                   cross-task hint bank and attach it as a REFERENCE card for the
                   replanner (never executed, never coordinates).
+  forbid (Arm C): Arm A + a state-local contract that rejects the exact repeated
+                  action and asks the same model for one different action.
 
 Independence contract: this module is orthogonal to --recovery (the frozen
 intra-task action-interface repair arm, which owns pre-boundary/representation
-failures) and to the error ledger. It only ever ADDS a text block to the next
-user turn; it never modifies actions, responses, or the repair flow. With
---stall_recovery off the agent prompt stays byte-identical to baseline.
+failures) and to the error ledger. The replan/hint arms only add text to the next
+user turn. The forbid arm may reject and regenerate one exact repeated action;
+it does not alter the interface-repair flow. With --stall_recovery off the agent
+prompt stays byte-identical to baseline.
 
 Online stall rule (deliberately minimal -- one rule):
   exact_repeat  k consecutive equivalent EXECUTED actions (args included), no
@@ -91,8 +94,22 @@ def pseudo_action(response_text: str) -> str:
     return matches[0].strip() if matches else ""
 
 
+def _strip_mangle_noise(text: str) -> str:
+    """Same normalization as main._strip_code_noise: drop the serialization
+    mangle (leading ``python\\n`` literal or line, trailing ``\\n``) so a mangled
+    and a clean submission of the SAME action share one key. Without this the
+    impress uptake audit showed the loop 'escaping' by re-emitting the identical
+    action minus the mangle prefix -- a fake behavior change."""
+    text = re.sub(r"^\s*python\\n", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^\s*python\s*\n", "", text, flags=re.IGNORECASE).strip()
+    if text.endswith("\\n"):
+        text = text[:-2].strip()
+    return text
+
+
 def action_key(action_text: str) -> str:
-    text = _ADAPTER_CALL_RE.sub("", str(action_text or "")).strip(" ;")
+    text = _strip_mangle_noise(str(action_text or ""))
+    text = _ADAPTER_CALL_RE.sub("", text).strip(" ;")
     return re.sub(r"\s+", "", text).lower()
 
 
@@ -112,7 +129,11 @@ def _executed_action_key(action: Any) -> str:
         except (TypeError, ValueError):
             return str(action)
 
-    text = _ADAPTER_CALL_RE.sub("", str(action)).strip(" ;")
+    # Mangle-normalize BEFORE keying: python\nX(...) and X(...) must share one
+    # key, or the detector misses mangle-alternating loops and the forbid hard
+    # ban is bypassable by re-emitting the same action with the mangle prefix.
+    text = _strip_mangle_noise(str(action))
+    text = _ADAPTER_CALL_RE.sub("", text).strip(" ;")
     if not text or text.lower() == "parse error":
         return ""
     try:
@@ -234,6 +255,7 @@ class StallDetector:
         result = str(exe_result or "")
         self.steps.append({
             "key": key,
+            "action": " ".join(str(executed_action or "").split())[:120],
             "is_error": not key or _has_error_result(result),
             "thumb": screenshot_thumbnail(screenshot),
         })
@@ -251,6 +273,8 @@ class StallDetector:
             "state_similarity": match["state_similarity"],
             "fire_index": self.fires,
             "step_index": step_index,
+            "stalled_key": self.steps[-1]["key"],
+            "stalled_action": self.steps[-1]["action"],
         }
 
 
@@ -331,6 +355,25 @@ class HintBank:
         return result
 
 
+def call_dumps(code_text: str) -> set:
+    """AST dump of each top-level statement in a submitted code block.
+
+    Used for EXACT per-statement containment checks in the state-local hard ban:
+    case- and string-content-faithful, unlike action_key (a fuzzy retrieval key
+    that lowercases and strips whitespace, so Agent.type(text='A B') and
+    Agent.type(text='ab') would collide). Returns an empty set when the text does
+    not parse; executable candidates are checked separately before dispatch."""
+    text = _strip_mangle_noise(str(code_text or ""))
+    text = _ADAPTER_CALL_RE.sub("", text).strip(" ;")
+    if not text:
+        return set()
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    return {ast.dump(node, include_attributes=False) for node in tree.body}
+
+
 def _masked_call_sequence(calls: Sequence[str], limit: int = 3) -> str:
     masked = []
     for call in list(calls)[:limit]:
@@ -339,13 +382,25 @@ def _masked_call_sequence(calls: Sequence[str], limit: int = 3) -> str:
     return " -> ".join(masked) if masked else "(not recorded)"
 
 
-def format_stall_intervention(signal: Dict[str, Any], hint: Optional[dict] = None) -> str:
+def format_stall_intervention(
+    signal: Dict[str, Any], hint: Optional[dict] = None, forbid: bool = False
+) -> str:
     lines = [
         "* Stall Alert: You appear to be stuck -- {}. The current approach is not "
         "making progress. Stop repeating it. Re-examine the current screen and "
         "re-plan with a DIFFERENT method (a different menu path, tool, or API) to "
         "move the task forward.".format(signal.get("detail", "repeated behavior detected"))
     ]
+    if forbid:
+        lines.append(
+            "* Recovery Contract (mandatory): the current screen did not change after "
+            "`{stalled}`. Do NOT submit that exact action again while this screen remains "
+            "unchanged. Choose ONE different executable next action for the current "
+            "screen and output it in a single fenced python code block. Do not generate "
+            "multiple candidate plans.".format(
+                stalled=str(signal.get("stalled_action", ""))[:120] or "(your previous action)"
+            )
+        )
     if hint is not None:
         lines.append(
             "* Reference from a similar past task (it may NOT apply here -- trust the "
